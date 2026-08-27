@@ -27,6 +27,7 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
+    _every_account_above_threshold,
     _priority_order_index,
     _recovery_is_useful,
     pct_label,
@@ -47,6 +48,16 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+
+class _NoAccountOverrides:
+    """Minimal `.switcher` stand-in for tests that drive a bare
+    `AutoSwitchEngine` subclass (bypassing `__init__`) to exercise one
+    ranking/anti-flap function in isolation: every account uses the fleet
+    default threshold, no per-account override."""
+
+    def account_threshold_override(self, account_num: str) -> float | None:
+        return None
 
 
 def _iso_at(epoch: float) -> str:
@@ -3434,6 +3445,103 @@ class TestPriorityStrategy:
         assert sw.trigger == "proactive"
 
 
+class TestPerAccountThreshold:
+    """A per-account override of ``autoswitch.threshold``
+    (``cswap threshold <num> <pct>``) wins over the fleet default for that
+    one account, at every place the engine asks "is THIS account healthy?"."""
+
+    def test_effective_threshold_prefers_override_over_settings(self, harness):
+        assert harness.engine._effective_threshold("1") == 90.0
+        harness.switcher.set_account_threshold("1", 95.0)
+        assert harness.engine._effective_threshold("1") == 95.0
+
+    def test_effective_threshold_falls_back_when_unset(self, harness):
+        harness.switcher.set_account_threshold("1", 95.0)
+        harness.switcher.unset_account_threshold("1")
+        assert harness.engine._effective_threshold("1") == 90.0
+
+    def test_active_own_higher_override_delays_proactive_switch(self, harness):
+        # 93% used clears the global default (90) but not #1's own raised
+        # override (97) -- must stay, even with a far healthier peer.
+        harness.switcher.set_account_threshold("1", 97.0)
+        outcome = harness.tick_with_usage({
+            "1": _usage(93), "2": _usage(20), "3": _usage(20),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+    def test_active_own_lower_override_triggers_switch_earlier(self, harness):
+        # 85% used is healthy by the global default (90) but not by #1's own
+        # lowered override (80) -- must move even though the global default
+        # would have left it alone.
+        harness.switcher.set_account_threshold("1", 80.0)
+        outcome = harness.tick_with_usage({
+            "1": _usage(85), "2": _usage(20), "3": _usage(85),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_candidate_own_lower_override_excludes_it_as_landing_spot(self, harness):
+        # Without any override, #2 (30 pts headroom) beats #3 (15 pts) and
+        # both clear the hysteresis margin against #1's 5 pts -- `best` would
+        # normally land on #2. #2's own lowered override (60) means 70% used
+        # already re-triggers a switch on arrival, so it must be excluded
+        # even though it looks like the better landing spot by the global
+        # default -- #3 (no override) is the only one left.
+        harness.switcher.set_account_threshold("2", 60.0)
+        outcome = harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(70), "3": _usage(85),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_priority_strategy_ordering_is_unaffected_by_overrides(self, temp_home):
+        # #2's raised override (99) makes it "healthy" at 95% used, but
+        # priority ranks by rotation order, not by degree of health -- #1
+        # (no override, plainly healthy at 20%) must still win because it
+        # outranks #2, proving the per-account threshold change only widens
+        # or narrows what counts as "healthy," never touches priority's own
+        # ordering logic.
+        h = EngineHarness(temp_home, strategy="priority")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("c@example.com", 3)
+        h.switcher.set_account_threshold("2", 99.0)
+
+        outcome = h.tick_with_usage({
+            "1": _usage(20), "2": _usage(95), "3": _usage(95),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_every_account_above_threshold_uses_per_account_threshold(self):
+        # Uniform thresholds: unchanged behaviour from before per-account
+        # overrides existed -- both candidates measured above the same bar.
+        assert _every_account_above_threshold(
+            candidates=["2", "3"],
+            headroom={"2": 4.0, "3": 7.0},
+            active_headroom=5.0,
+            active_threshold=90.0,
+            threshold_for=lambda _n: 90.0,
+        ) is True
+
+        # #3's own raised threshold (97) is not cleared at 93% used (7 pts
+        # headroom) even though the fleet default (90) would call it spent --
+        # "every account above ITS OWN threshold" must read False here.
+        assert _every_account_above_threshold(
+            candidates=["2", "3"],
+            headroom={"2": 4.0, "3": 7.0},
+            active_headroom=5.0,
+            active_threshold=90.0,
+            threshold_for=lambda n: {"2": 90.0, "3": 97.0}[n],
+        ) is False
+
+
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:
     """A `consume-first` departure's phase-2 refetch can write
     `(leftHeadroom, leftRecoveryAt) = (None, None)`, the exact snapshot
@@ -3463,6 +3571,8 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         class Fake(AutoSwitchEngine):
             def __init__(self):
                 self._models = ()
+                self.switcher = _NoAccountOverrides()
+                self.settings = AutoSwitchSettings()
 
         e = Fake()
         settings = AutoSwitchSettings()
@@ -3512,6 +3622,8 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         class Fake(AutoSwitchEngine):
             def __init__(self):
                 self._models = ()
+                self.switcher = _NoAccountOverrides()
+                self.settings = AutoSwitchSettings()
 
         e = Fake()
         settings = AutoSwitchSettings()
@@ -3548,6 +3660,8 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         class Fake(AutoSwitchEngine):
             def __init__(self):
                 self._models = ()
+                self.switcher = _NoAccountOverrides()
+                self.settings = AutoSwitchSettings()
 
         e = Fake()
         settings = AutoSwitchSettings()

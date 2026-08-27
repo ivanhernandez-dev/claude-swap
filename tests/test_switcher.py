@@ -506,6 +506,129 @@ class TestAliasCommand:
         assert switcher.list_aliases() == []
 
 
+class TestAccountThresholdCommand:
+    """Test ClaudeAccountSwitcher.set_account_threshold()/unset_account_threshold()/
+    list_account_thresholds()/account_threshold_override()."""
+
+    def _write(self, switcher, data):
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+
+    def test_set_account_threshold_by_number(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        num, value = switcher.set_account_threshold("2", 95.0)
+
+        assert num == "2"
+        assert value == 95.0
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["thresholdOverride"] == 95.0
+
+    def test_set_account_threshold_by_email(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        num, _ = switcher.set_account_threshold("account2@example.com", 80.0)
+
+        assert num == "2"
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["thresholdOverride"] == 80.0
+
+    def test_set_account_threshold_out_of_range_raises(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        with pytest.raises(ValidationError):
+            switcher.set_account_threshold("2", 30.0)
+        with pytest.raises(ValidationError):
+            switcher.set_account_threshold("2", 100.0)
+
+    def test_set_account_threshold_at_bounds_is_valid(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        switcher.set_account_threshold("2", 50.0)
+        switcher.set_account_threshold("2", 99.9)
+
+    def test_account_threshold_unknown_account_raises(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        with pytest.raises(AccountNotFoundError):
+            switcher.set_account_threshold("999", 95.0)
+
+    def test_unset_account_threshold(self, temp_home: Path, sample_sequence_data: dict):
+        sample_sequence_data["accounts"]["2"]["thresholdOverride"] = 95.0
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        num = switcher.unset_account_threshold("2")
+
+        assert num == "2"
+        data = switcher._get_sequence_data()
+        assert "thresholdOverride" not in data["accounts"]["2"]
+
+    def test_unset_account_threshold_idempotent(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        switcher.unset_account_threshold("2")  # never set — should be a silent no-op
+        switcher.unset_account_threshold("2")
+
+    def test_list_account_thresholds(self, temp_home: Path, sample_sequence_data: dict):
+        sample_sequence_data["accounts"]["2"]["thresholdOverride"] = 95.0
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        assert switcher.list_account_thresholds() == [
+            ("2", 95.0, "account2@example.com")
+        ]
+
+    def test_list_account_thresholds_empty(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        assert switcher.list_account_thresholds() == []
+
+    def test_account_threshold_override_absent_is_none(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        assert switcher.account_threshold_override("2") is None
+
+    def test_account_threshold_survives_swap(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A per-account override travels with the account through a slot
+        swap, same as alias does — it belongs to the account, not the slot
+        number."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher.set_account_threshold("1", 95.0)
+
+        switcher.swap_accounts("1", "2")
+
+        assert switcher.account_threshold_override("2") == 95.0
+        assert switcher.account_threshold_override("1") is None
+
+
 class TestDirectorySetup:
     """Test directory setup."""
 
