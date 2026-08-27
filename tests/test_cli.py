@@ -1312,6 +1312,119 @@ class TestAliasCommand:
             cli.main()
         alias_fn.assert_called_once_with(["2", "dev"])
 
+
+class TestThresholdCommand:
+    """`cswap threshold` — set/unset/list a per-account autoswitch.threshold override."""
+
+    def _seeded_switcher_env(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"] = {
+            "email": "work@co.com",
+            "uuid": "u2",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [2]
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def test_set_threshold_by_number(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._threshold_command(["2", "95"])
+
+        data = ClaudeAccountSwitcher()._get_sequence_data()
+        assert data["accounts"]["2"]["thresholdOverride"] == 95.0
+        assert "95" in capsys.readouterr().out
+
+    def test_set_threshold_by_email(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._threshold_command(["work@co.com", "95"])
+
+        data = ClaudeAccountSwitcher()._get_sequence_data()
+        assert data["accounts"]["2"]["thresholdOverride"] == 95.0
+
+    def test_unset_threshold(self, temp_home, capsys):
+        switcher = self._seeded_switcher_env(temp_home)
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"]["thresholdOverride"] = 95.0
+        switcher._write_json(switcher.sequence_file, data)
+
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._threshold_command(["2", "--unset"])
+
+        data = ClaudeAccountSwitcher()._get_sequence_data()
+        assert "thresholdOverride" not in data["accounts"]["2"]
+
+    def test_list_thresholds(self, temp_home, capsys):
+        switcher = self._seeded_switcher_env(temp_home)
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"]["thresholdOverride"] = 95.0
+        switcher._write_json(switcher.sequence_file, data)
+
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._threshold_command([])
+
+        out = capsys.readouterr().out
+        assert "95" in out
+
+    def test_list_thresholds_empty(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._threshold_command([])
+
+        assert "No per-account threshold overrides" in capsys.readouterr().out
+
+    def test_missing_value_errors(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit):
+                cli._threshold_command(["2"])
+
+    def test_unset_without_account_errors(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit):
+                cli._threshold_command(["--unset"])
+
+    def test_unset_with_value_errors(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit):
+                cli._threshold_command(["2", "95", "--unset"])
+
+    def test_non_numeric_value_errors(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit):
+                cli._threshold_command(["2", "not-a-number"])
+
+    def test_out_of_range_value_errors(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._threshold_command(["2", "30"])
+        assert exc.value.code == 1
+        assert "Error" in capsys.readouterr().err
+
+    def test_unknown_account_errors(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._threshold_command(["999", "95"])
+        assert exc.value.code == 1
+
+    def test_dispatched_from_main(self, temp_home):
+        with patch("claude_swap.cli._threshold_command") as threshold_fn, \
+             patch.object(sys, "argv", ["claude-swap", "threshold", "2", "95"]):
+            cli.main()
+        threshold_fn.assert_called_once_with(["2", "95"])
+
     @pytest.mark.skipif(sys.platform == "win32", reason="root guard is POSIX-only")
     def test_alias_refuses_root(self, temp_home, capsys):
         self._seeded_switcher_env(temp_home)

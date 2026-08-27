@@ -84,7 +84,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    SETTING_SPECS,
+    load_settings,
+    parse_model_names,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -1046,6 +1051,93 @@ class ClaudeAccountSwitcher:
             if acc.get("alias")
         ]
         return sorted(rows, key=lambda r: int(r[0]))
+
+    def set_account_threshold(self, identifier: str, value: float) -> tuple[str, float]:
+        """Set a per-account override of ``autoswitch.threshold`` for the
+        account matching identifier.
+
+        ``identifier`` is a slot number, email, or alias. Returns
+        ``(account_num, value)``. The bounds mirror the global
+        ``autoswitch.threshold`` setting exactly (same spec, single source of
+        truth), so a value valid for one is valid for the other.
+
+        Raises:
+            AccountNotFoundError: identifier doesn't match any account.
+            ValidationError: value is outside the allowed range.
+        """
+        self._refuse_session_shell()
+        spec = SETTING_SPECS["autoswitch.threshold"]
+        if not spec.lo <= value <= spec.hi:
+            raise ValidationError(
+                f"Threshold must be between {spec.lo} and {spec.hi}, got: {value}"
+            )
+
+        self._get_sequence_data_migrated()
+        account_num = self._resolve_account_identifier(identifier)
+        if not account_num:
+            raise AccountNotFoundError(
+                f"No account found with identifier: {identifier}"
+            )
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+
+        record["thresholdOverride"] = value
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        return account_num, value
+
+    def unset_account_threshold(self, identifier: str) -> str:
+        """Clear the per-account threshold override for the account matching
+        identifier.
+
+        Returns the account number. Idempotent: clearing an already-unset
+        override succeeds silently, matching ``unset_alias``'s posture of
+        "the end state is what you asked for".
+
+        Raises:
+            AccountNotFoundError: identifier doesn't match any account.
+        """
+        self._refuse_session_shell()
+        self._get_sequence_data_migrated()
+        account_num = self._resolve_account_identifier(identifier)
+        if not account_num:
+            raise AccountNotFoundError(
+                f"No account found with identifier: {identifier}"
+            )
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+
+        if "thresholdOverride" in record:
+            del record["thresholdOverride"]
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+        return account_num
+
+    def list_account_thresholds(self) -> list[tuple[str, float, str]]:
+        """Every set per-account threshold override as
+        ``(account_num, value, email)``, slot-number order."""
+        data = self._get_sequence_data_migrated()
+        accounts = (data or {}).get("accounts", {})
+        rows = [
+            (num, acc["thresholdOverride"], acc.get("email", ""))
+            for num, acc in accounts.items()
+            if acc.get("thresholdOverride") is not None
+        ]
+        return sorted(rows, key=lambda r: int(r[0]))
+
+    def account_threshold_override(self, account_num: str) -> float | None:
+        """This account's own ``autoswitch.threshold`` override, or ``None``
+        when it uses the fleet default. No migration needed: a record
+        created before this field existed simply has no key, which already
+        means "use the default" (same convention as ``alias``/``disabled``/
+        ``kind``)."""
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num))
+        return record.get("thresholdOverride") if record else None
 
     def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
         """Exchange two accounts' slot numbers (list order / numeric targets).
@@ -5057,12 +5149,19 @@ class ClaudeAccountSwitcher:
                 continue
             before = pre.get(num)
             recent_429 = before is not None and before.recent_429(now)
+            # A per-account threshold override steers this account's own
+            # urgent-mode cadence too, not just the switch decision — falls
+            # back to the fleet default (already CLI-merged by
+            # _poll_policy_inputs) when unset.
+            acct_threshold = self.account_threshold_override(num)
+            if acct_threshold is None:
+                acct_threshold = threshold
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,
                 prev_usage=before.last_good if before else None,
                 new_usage=rec.usage,
                 is_active=bool(info_by_num[num][4]),
-                threshold=threshold,
+                threshold=acct_threshold,
                 models=models,
                 recent_429=recent_429,
                 now=now,
@@ -5344,6 +5443,7 @@ class ClaudeAccountSwitcher:
                     last_good_usage=entry.last_good,
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
+                    threshold_override=self.account_threshold_override(str(num)),
                 )
             )
         payload = {
@@ -5408,6 +5508,9 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            threshold_override = self.account_threshold_override(str(num))
+            if threshold_override is not None:
+                markers += f" {muted(f'(threshold {threshold_override:g}%)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")

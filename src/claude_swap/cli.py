@@ -561,6 +561,95 @@ Examples:
         sys.exit(130)
 
 
+def _threshold_command(argv: list[str]) -> None:
+    """Handle `cswap threshold [NUM|EMAIL|ALIAS] [PCT] [--unset]`.
+
+    With no arguments, lists every account's threshold override. Otherwise
+    sets (or, with --unset, removes) the per-account override of
+    `autoswitch.threshold` for the given account — it wins over the fleet
+    default even when a one-off `--threshold` is passed to `cswap auto`.
+    Pre-dispatched before the main parser for the same reason as `alias`.
+    """
+    from claude_swap.settings import SETTING_SPECS
+
+    spec = SETTING_SPECS["autoswitch.threshold"]
+    parser = argparse.ArgumentParser(
+        prog="cswap threshold",
+        description=(
+            "Set, remove, or list a per-account override of "
+            "autoswitch.threshold. Overrides the fleet default for that one "
+            "account — including a one-off `cswap auto --threshold` — until "
+            "unset."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Examples:
+  cswap threshold 2 95
+  cswap threshold user@example.com 95
+  cswap threshold 2 --unset
+  cswap threshold                     # list all overrides
+
+Range: {spec.lo}-{spec.hi} (same bounds as autoswitch.threshold).
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to override (number or email). Omit to list overrides.",
+    )
+    parser.add_argument(
+        "value",
+        nargs="?",
+        metavar="PCT",
+        help=f"Threshold to set, {spec.lo}-{spec.hi}.",
+    )
+    parser.add_argument("--unset", action="store_true", help="Remove the account's override")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.unset and args.value:
+        parser.error("--unset does not take a PCT argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL is required with --unset")
+    if args.account is not None and not args.unset and not args.value:
+        parser.error("PCT is required (or pass --unset to remove the override)")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.account is None:
+            rows = switcher.list_account_thresholds()
+            if not rows:
+                print(dimmed("No per-account threshold overrides set"))
+                return
+            print(bolded("Threshold overrides:"))
+            for num, value, email in rows:
+                print(f"  {num}: {value:g}% {muted(f'({email})')}")
+            return
+
+        if args.unset:
+            account_num = switcher.unset_account_threshold(args.account)
+            print(f"{accent('Removed threshold override')} for Account {account_num}")
+        else:
+            try:
+                value = float(args.value)
+            except ValueError:
+                parser.error(f"PCT must be a number, got: {args.value!r}")
+            account_num, value = switcher.set_account_threshold(args.account, value)
+            print(
+                f"{accent('Set threshold override')} {value:g}% for "
+                f"Account {account_num}"
+            )
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -943,6 +1032,9 @@ def main() -> None:
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
+    if argv and argv[0] == "threshold":
+        _threshold_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -985,6 +1077,9 @@ Commands:
   %(prog)s alias <num|email> <name>   set a short alias for an account
   %(prog)s alias <num|email> --unset  remove an account's alias
   %(prog)s alias                      list all aliases
+  %(prog)s threshold <num|email> <pct> set an account's own switch-away threshold
+  %(prog)s threshold <num|email> --unset remove an account's threshold override
+  %(prog)s threshold                  list all threshold overrides
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits

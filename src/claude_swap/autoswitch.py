@@ -617,23 +617,32 @@ def _every_account_above_threshold(
     candidates: Sequence[str],
     headroom: dict[str, float | None],
     active_headroom: float | None,
-    threshold: float,
+    active_threshold: float,
+    threshold_for: Callable[[str], float],
 ) -> bool:
     """Whether the active account AND every measured candidate are at or over
-    the threshold — the state where "land somewhere healthy" has no answer.
+    ITS OWN threshold — the state where "land somewhere healthy" has no answer.
 
     Requires the active account's own headroom to be known: without it we do
     not know we are in this state, and guessing here would relax the landing
     rule on an ordinary tick. An unmeasured candidate does not block the
     verdict (it may be healthy, but it cannot be *chosen* either — the caller
     skips ``None`` headroom) as long as at least one candidate was measured.
+
+    ``active_threshold`` and ``threshold_for`` let a per-account override
+    (``cswap threshold <num> <pct>``) answer this per account rather than
+    against one shared value — a module-level pure function has no ``self``
+    to look the override up itself, so the caller (a bound engine method)
+    resolves it and passes both in.
     """
-    if active_headroom is None or (100.0 - active_headroom) < threshold:
+    if active_headroom is None or (100.0 - active_headroom) < active_threshold:
         return False
-    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    measured = [
+        (n, headroom.get(n)) for n in candidates if headroom.get(n) is not None
+    ]
     if not measured:
         return False
-    return all((100.0 - h) >= threshold for h in measured)
+    return all((100.0 - h) >= threshold_for(n) for n, h in measured)
 
 
 def _ref(number: str, email: str) -> dict:
@@ -785,6 +794,18 @@ class AutoSwitchEngine:
         for number, email, reason in to_release:
             self._emit(UnquarantineEvent(number=number, email=email, reason=reason))
         return state
+
+    # -- threshold --------------------------------------------------------------
+
+    def _effective_threshold(self, account_num: str) -> float:
+        """This account's own switch-away limit: its per-account override
+        (``cswap threshold <num> <pct>``) when set, else the fleet default
+        (``self.settings.threshold``, already CLI-merged). The override wins
+        even over a one-off ``--threshold`` flag — it is the more specific,
+        deliberately-set policy for this one account.
+        """
+        override = self.switcher.account_threshold_override(account_num)
+        return override if override is not None else self.settings.threshold
 
     # -- freshening -----------------------------------------------------------
 
@@ -956,14 +977,15 @@ class AutoSwitchEngine:
             "email": "",
         }
 
+        active_threshold = self._effective_threshold(current)
         entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold
+            current, quarantined, threshold=active_threshold
         )
         self._emit(
             PollEvent(
                 active=active_ref,
                 headroom=headroom,
-                threshold=settings.threshold,
+                threshold=active_threshold,
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -999,7 +1021,7 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            if utilization < active_threshold:
                 if settings.strategy not in ("consume-first", "priority"):
                     self._emit(
                         NoSwitchEvent(
@@ -1008,7 +1030,7 @@ class AutoSwitchEngine:
                             # display an impossible "100% < 99.9%".
                             detail=(
                                 f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                                f"{pct_label(active_threshold)}%"
                             ),
                         )
                     )
@@ -1113,7 +1135,7 @@ class AutoSwitchEngine:
                     reason="below-threshold",
                     detail=(
                         f"{pct_label(100.0 - active_headroom)}% < "
-                        f"{pct_label(settings.threshold)}%"
+                        f"{pct_label(active_threshold)}%"
                     ),
                 )
             )
@@ -1553,7 +1575,7 @@ class AutoSwitchEngine:
                     return None               # beats us outright; not a flip
             elif (
                 settings is not None
-                and left_headroom > 100.0 - settings.threshold
+                and left_headroom > 100.0 - self._effective_threshold(barred)
             ):
                 # An unreadable active must not be silently scored as "the
                 # peer does not beat it" -- same landing-eligible fallback
@@ -1729,7 +1751,7 @@ class AutoSwitchEngine:
             # when a nearer window starts binding, never as a side effect
             # of the active spending down -- the failure mode a bare
             # dominance leg has, guarded directly in the mutation table.
-            if h is not None and h > 100.0 - settings.threshold:
+            if h is not None and h > 100.0 - self._effective_threshold(barred):
                 return True
             peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
             active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
@@ -1795,7 +1817,7 @@ class AutoSwitchEngine:
             if active_headroom is not None:
                 if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
                     return True
-            elif h > 100.0 - settings.threshold:
+            elif h > 100.0 - self._effective_threshold(barred):
                 return True
         if (
             isinstance(left_headroom, (int, float))
@@ -1857,7 +1879,11 @@ class AutoSwitchEngine:
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
         all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates,
+            headroom,
+            active_headroom,
+            self._effective_threshold(current),
+            self._effective_threshold,
         )
         # "Is anything worth having?" — the most headroom any candidate with a
         # READABLE row offers. Two exclusions and no others:
@@ -1914,7 +1940,7 @@ class AutoSwitchEngine:
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                if (100.0 - h) >= self._effective_threshold(num) and not all_above:
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below
