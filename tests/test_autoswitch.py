@@ -27,6 +27,7 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
+    _priority_order_index,
     _recovery_is_useful,
     pct_label,
 )
@@ -3183,6 +3184,256 @@ class TestConsumeFirstStrategy:
         assert sw.trigger == "at-limit"
 
 
+class TestPriorityOrderIndex:
+    def test_present_returns_position(self):
+        assert _priority_order_index(["3", "1", "2"], "1") == 1
+
+    def test_absent_sorts_last(self):
+        order = ["1", "2"]
+        assert _priority_order_index(order, "9") == len(order)
+
+    def test_none_sorts_last(self):
+        order = ["1", "2"]
+        assert _priority_order_index(order, None) == len(order)
+
+
+class TestPriorityStrategy:
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="priority")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_reclaims_recovered_higher_priority_account_while_current_is_healthy(
+        self, temp_home
+    ):
+        # Active is #2 (already below threshold), but #1 outranks it and has
+        # ALSO recovered below threshold -- priority must reclaim #1 even
+        # though #2 is perfectly healthy and nothing forces a move.
+        h = EngineHarness(temp_home, strategy="priority")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("b@example.com", 2)
+        outcome = h.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(30),
+            "3": _usage(10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "priority"
+        assert sw.to_ref == {"number": 1, "email": "a@example.com"}
+
+    def test_stays_when_current_is_already_highest_priority_healthy(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(30),
+            "3": _usage(10),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-highest-priority"]
+
+    def test_does_not_reclaim_a_later_ordered_healthy_account(self, temp_home):
+        # #2 has far more headroom than active #1, but it is LOWER priority
+        # (later in order) -- priority must ignore headroom entirely here,
+        # unlike `best`, which would jump to #2.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(50),
+            "2": _usage(5),
+            "3": _usage(5),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-highest-priority"]
+
+    def test_escape_picks_earliest_ordered_candidate_not_most_headroom(
+        self, temp_home
+    ):
+        # Active #1 crosses the threshold and must move. #2 has LESS headroom
+        # than #3 but is earlier in order -- priority takes #2, not the
+        # `best`-preferred #3.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(95),
+            "2": _usage(50),
+            "3": _usage(10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_at_limit_escape_ranks_by_sequence_order_not_headroom(self, temp_home):
+        # Active #1 is fully spent (at-limit escape, which skips the
+        # threshold gate entirely). #2 has almost no headroom but is earlier
+        # in order than #3, which is nearly empty -- priority still takes #2.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(100),
+            "2": _usage(95),
+            "3": _usage(50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+
+    def test_cooldown_bounds_a_rapid_reclaim_on_a_flickering_higher_priority_account(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, strategy="priority")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("c@example.com", 3)
+
+        # #2 recovers -> reclaim 3 -> 2.
+        outcome = h.tick_with_usage({
+            "1": _usage(95),
+            "2": _usage(20),
+            "3": _usage(20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        # Moments later #1 (higher priority still) also recovers -- a second
+        # reclaim within the cooldown window must be refused, not taken.
+        h.clock.advance(60)
+        h.events.clear()
+        outcome = h.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(20),
+            "3": _usage(20),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["cooldown"]
+
+        # Once the cooldown (default 300s) has fully elapsed, the same
+        # recovered #1 is reclaimed.
+        h.clock.advance(250)
+        h.events.clear()
+        outcome = h.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(20),
+            "3": _usage(20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "priority"
+
+    def test_api_key_only_peers_below_threshold_is_no_action(self, temp_home):
+        # Mirrors consume-first's own version of this test: an included
+        # API-key peer is never a priority target (it has no rotation-order
+        # standing worth reclaiming), so a healthy below-threshold tick with
+        # no OAuth peers must stay NO_ACTION/below-threshold, not report a
+        # false BLOCKED/no-comparison from the empty OAuth ranking.
+        h = EngineHarness(
+            temp_home, strategy="priority", include_api_key_accounts=True
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        outcome = h.tick_with_usage({
+            "1": _usage(20),
+            "2": "api key",
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+    def test_reorder_via_swap_changes_priority_order(self, temp_home):
+        # Reordering is already exposed via `cswap swap`/`cswap move`, which
+        # trade the ACCOUNTS occupying two slot numbers rather than relabel
+        # them -- so swapping slots 1 and 3 makes #3 (now holding the
+        # formerly-#1 account) the live one, and #1 (now holding the
+        # formerly-#3 account) the new highest priority.
+        h = self._harness(temp_home)
+        h.switcher.swap_accounts("1", "3")
+        assert h.active_number() == 3
+
+        outcome = h.tick_with_usage({
+            "1": _usage(20),   # formerly #3's account, now highest priority
+            "2": _usage(20),
+            "3": _usage(20),   # formerly #1's account, now active
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.to_ref == {"number": 1, "email": "c@example.com"}
+
+    def test_disabled_current_account_is_treated_as_lowest_priority(self, temp_home):
+        h = EngineHarness(temp_home, strategy="priority")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.switcher.set_account_disabled("1", True)
+        h.events.clear()
+
+        # #1 is healthy but out of rotation -- it must not retain top
+        # priority. #2 is the only in-rotation account, so it outranks the
+        # disabled active even though it is numerically later.
+        outcome = h.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "priority"
+
+    def test_no_return_bar_does_not_block_an_immediate_reclaim(self, temp_home):
+        """The `best`/`consume-first` no-return bar exists to stop flapping
+        back to an account abandoned for being worse, unless it has
+        measurably improved since departure (see `_left_account_recovered`).
+        For `priority`, reclaiming a recovered higher-priority account is the
+        strategy's whole point, not a flap -- so it must switch back
+        immediately even when the departed account looks IDENTICAL to how it
+        looked at departure (the case that would otherwise leave it barred).
+        """
+        h = EngineHarness(temp_home, strategy="priority")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("b@example.com", 2)
+        h.events.clear()
+
+        # #1 recovers -> reclaim 2 -> 1. Departure snapshot: #2 at 50 pts
+        # headroom, no known reset (recovery_ts stays inf on both sides).
+        outcome = h.tick_with_usage({"1": _usage(20), "2": _usage(50)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert h.state()["lastSwitchFrom"] == 2
+        assert h.state()["leftHeadroom"] == 50.0
+
+        # Well past cooldown, #1 crosses the threshold and must move back to
+        # #2 -- which now looks EXACTLY as it did at departure (88 pts used,
+        # same as the 50-pt baseline would need a dominance/improvement leg
+        # to clear). best/consume-first would stay barred here; priority
+        # does not use that bar at all.
+        h.clock.advance(400)
+        h.events.clear()
+        outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(88)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:
     """A `consume-first` departure's phase-2 refetch can write
     `(leftHeadroom, leftRecoveryAt) = (None, None)`, the exact snapshot
@@ -4631,6 +4882,7 @@ class TestHorizonAxisDoesNotFlap:
         args = dict(
             trigger="proactive",
             consume_first=False,
+            priority=False,
             oauth_candidates=["1", "3"],
             usage={"1": _usage(40), "2": _usage(96), "3": _usage(99)},
             headroom={"1": 60.0, "2": 4.0, "3": 1.0},

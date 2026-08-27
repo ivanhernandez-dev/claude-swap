@@ -20,7 +20,14 @@ activation the target's token is *freshened* (refreshed if it expires within
 under-lock re-read sees a fresh token and aborts its own refresh); a target
 whose refresh token is dead gets quarantined instead of activated. When the
 active account's own usage becomes unreadable for ``unhealthy_ticks``
-consecutive ticks, the engine fails over to any healthy candidate.
+consecutive ticks, the engine fails over to any healthy candidate. That is
+the default ``"best"`` strategy; ``"consume-first"`` instead proactively
+spends whichever account's weekly window resets soonest, and ``"priority"``
+always runs the earliest account (by rotation order, reorderable via
+``cswap move``/``cswap swap-accounts``) that is below the threshold,
+reclaiming a higher-priority account the moment it recovers even while the
+active one is still healthy — a primary/backup pattern, with
+``cooldown_seconds`` as its only anti-flap guard.
 
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
@@ -362,7 +369,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "priority"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -589,6 +596,21 @@ def _binding_recovery_ts(
     _label, _pct, resets_at = max(windows, key=lambda w: w[1])
     ts = _parse_reset_ts(resets_at)
     return ts if ts is not None and ts > now else float("inf")
+
+
+def _priority_order_index(order: Sequence[str], number: str | None) -> int:
+    """Position of ``number`` in the user's rotation order (lower = preferred).
+
+    The ``priority`` strategy's whole ranking key. An account not in ``order``
+    (disabled, unmanaged, or the active slot itself when it has fallen out of
+    rotation) sorts last — any in-rotation candidate outranks it immediately,
+    which is what lets ``priority`` escape off a disabled/dropped active
+    without a special case.
+    """
+    try:
+        return order.index(str(number))
+    except ValueError:
+        return len(order)
 
 
 def _every_account_above_threshold(
@@ -978,7 +1000,7 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
+                if settings.strategy not in ("consume-first", "priority"):
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -993,9 +1015,11 @@ class AutoSwitchEngine:
                     return TickOutcome.NO_ACTION
                 # consume-first: below the threshold we still proactively move to
                 # whichever account's weekly window resets soonest, to burn the
-                # most-perishable quota first. Candidate selection decides whether
-                # a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                # most-perishable quota first. priority: below the threshold we
+                # still check whether a higher-priority (earlier-ordered) account
+                # has become healthy again, to reclaim it immediately. Candidate
+                # selection decides whether either target actually exists.
+                trigger = settings.strategy
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
@@ -1046,7 +1070,10 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if (
+            trigger in ("proactive", "consume-first", "priority")
+            and self._in_cooldown(state)
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1069,7 +1096,7 @@ class AutoSwitchEngine:
             else []
         )
         if (
-            trigger == "consume-first"
+            trigger in ("consume-first", "priority")
             and not oauth_candidates
             and active_headroom is not None
         ):
@@ -1077,10 +1104,10 @@ class AutoSwitchEngine:
             # against — the same state `best` reports as below-threshold
             # NO_ACTION before ever reaching candidate selection. API-key
             # candidates don't change the outcome: they have no weekly window
-            # to consume, so a consume-first nudge never targets them. Keep
-            # the exit-code contract identical across strategies: cron
-            # wrappers keying on BLOCKED must not see false "blocked" from
-            # the flag alone.
+            # to consume (consume-first) or priority rank worth reclaiming
+            # (priority), so this nudge never targets them. Keep the exit-code
+            # contract identical across strategies: cron wrappers keying on
+            # BLOCKED must not see false "blocked" from the flag alone.
             self._emit(
                 NoSwitchEvent(
                     reason="below-threshold",
@@ -1099,6 +1126,7 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
+        priority = settings.strategy == "priority"
 
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
@@ -1148,24 +1176,33 @@ class AutoSwitchEngine:
             # values. Computed once, the bar answered from a snapshot the
             # ranking had already thrown away — `left=20 active=30` bars,
             # `left=90 active=10` releases, and phase 2 is where that flips.
-            recovered = self._left_account_recovered(
-                state,
-                kw["usage"],
-                kw["headroom"],
-                kw["active_headroom"],
-                kw["settings"],
-                kw["now"],
-                kw["current"],
-            )
-            no_return = self._no_return_account(
-                trigger,
-                state,
-                kw["headroom"],
-                kw["active_headroom"],
-                recovered,
-                kw["settings"],
-                kw["current"],
-            )
+            #
+            # priority skips this bar entirely: it exists to stop best/
+            # consume-first flapping back to an account they abandoned for
+            # being worse, unless it measurably improved. Reclaiming a
+            # recovered higher-priority account is priority's whole point, not
+            # a flap — cooldown_seconds alone bounds how often it can happen.
+            if kw["settings"].strategy == "priority":
+                no_return = None
+            else:
+                recovered = self._left_account_recovered(
+                    state,
+                    kw["usage"],
+                    kw["headroom"],
+                    kw["active_headroom"],
+                    kw["settings"],
+                    kw["now"],
+                    kw["current"],
+                )
+                no_return = self._no_return_account(
+                    trigger,
+                    state,
+                    kw["headroom"],
+                    kw["active_headroom"],
+                    recovered,
+                    kw["settings"],
+                    kw["current"],
+                )
             ranked = self._rank_candidates(no_return=no_return, **kw)
             if no_return is not None and not ranked[0] and recovered:
                 unbarred = self._rank_candidates(no_return=None, **kw)
@@ -1177,6 +1214,7 @@ class AutoSwitchEngine:
         ordered, any_known, active_reset_ts = _rank(
             trigger=trigger,
             consume_first=consume_first,
+            priority=priority,
             oauth_candidates=oauth_candidates,
             usage=usage,
             headroom=headroom,
@@ -1186,13 +1224,13 @@ class AutoSwitchEngine:
             now=decided_now,
         )
 
-        if trigger == "consume-first" and ordered:
+        if trigger in ("consume-first", "priority") and ordered:
             # Two-phase commit: the provisional pick may have ridden a
-            # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
-            # decides below the threshold, where the collector only escalates
-            # inside the ESCALATION_MARGIN_PCT band (flat-traffic invariant).
-            # A switch is imminent, so spend the fetches now and re-decide on
-            # fresh data.
+            # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first and
+            # priority both decide below the threshold, where the collector
+            # only escalates inside the ESCALATION_MARGIN_PCT band (flat-
+            # traffic invariant). A switch is imminent, so spend the fetches
+            # now and re-decide on fresh data.
             # reserve() serves just-fetched accounts from the store, so this
             # is cheap in-tick and plan-bounded across ticks. The trigger is
             # deliberately NOT re-classified if the fresh active crossed the
@@ -1208,6 +1246,7 @@ class AutoSwitchEngine:
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
+                priority=priority,
                 oauth_candidates=oauth_candidates,
                 usage=usage,
                 headroom=headroom,
@@ -1217,10 +1256,17 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if (
+            not ordered
+            and api_key_candidates
+            and trigger not in ("consume-first", "priority")
+        ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
-            # nudge — those API-key accounts have no weekly window to consume.
+            # or priority nudge — those are opportunistic ("burn weekly quota
+            # sooner" / "reclaim a higher slot"), not an escape, and forcing a
+            # switch onto a metered account when the active is already healthy
+            # would be worse than doing nothing.
             ordered = api_key_candidates
 
         if not ordered:
@@ -1261,6 +1307,19 @@ class AutoSwitchEngine:
                     NoSwitchEvent(
                         reason="already-consuming-soonest",
                         detail="no sooner-resetting account with room to spare",
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            if trigger == "priority":
+                # Below the threshold and already the highest-priority healthy
+                # account: staying put is correct, never a block.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="already-highest-priority",
+                        detail=(
+                            "no higher-priority account is currently below "
+                            "threshold"
+                        ),
                     )
                 )
                 return TickOutcome.NO_ACTION
@@ -1313,12 +1372,13 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first":
+            if trigger in ("consume-first", "priority"):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
-                # is opportunistic, not an escape — never act on stale data
-                # or slide to a worse-ranked target; hold and retry next tick.
+                # and priority are both opportunistic, not an escape — never
+                # act on stale data or slide to a worse-ranked target; hold
+                # and retry next tick.
                 entry = entries.get(num)
                 if entry is None or not entry.fresh(self.clock()):
                     self._emit(
@@ -1757,6 +1817,7 @@ class AutoSwitchEngine:
         *,
         trigger: str,
         consume_first: bool,
+        priority: bool,
         oauth_candidates: list[str],
         no_return: str | None,
         usage: dict[str, dict | str | None],
@@ -1778,6 +1839,11 @@ class AutoSwitchEngine:
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
+        # priority ranks by position in the user's rotation order; computed
+        # once here rather than per-candidate so a disabled/dropped active
+        # (absent from `order`) still gets a well-defined (worst) index.
+        priority_order = self.switcher.switchable_account_numbers() if priority else ()
+        current_priority_idx = _priority_order_index(priority_order, current)
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
         # and holding out for one costs the user the session. Sitting still
@@ -1843,7 +1909,7 @@ class AutoSwitchEngine:
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first"):
+            if trigger in ("proactive", "consume-first", "priority"):
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
@@ -1907,13 +1973,23 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
+                elif priority:
+                    # Below the threshold, only reclaim an account that
+                    # outranks the active one (above the threshold we must
+                    # move, so any healthy account qualifies and the sort
+                    # below picks the highest-ranked).
+                    if trigger == "priority" and (
+                        _priority_order_index(priority_order, num)
+                        >= current_priority_idx
+                    ):
+                        continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
                     # qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if all_above and trigger in ("proactive", "consume-first"):
+            if all_above and trigger in ("proactive", "consume-first", "priority"):
                 # Ranked on the axis its own gate decided, and TIERED so the two
                 # stay comparable: a candidate returning inside the horizon
                 # beats one that does not, whatever its headroom. Untiered, the
@@ -1942,6 +2018,12 @@ class AutoSwitchEngine:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
+            elif priority:
+                # Rotation order alone — lower index (earlier/higher-priority
+                # slot) wins. Strategy-scoped rather than trigger-scoped, so
+                # this also reorders the at-limit/failover escape below by
+                # sequence order instead of headroom, for this strategy only.
+                key = (_priority_order_index(priority_order, num),)
             else:
                 key = (-h,)
             qualifying.append((key, num))
@@ -2124,7 +2206,10 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if (
+                trigger in ("proactive", "consume-first", "priority")
+                and self._in_cooldown(state)
+            ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
