@@ -652,12 +652,14 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "priority"),
         default=None,
         help=(
-            "Target selection: 'best' (most quota left; default) or "
+            "Target selection: 'best' (most quota left; default), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest)"
+            "resets soonest), or 'priority' (always run the earliest-in-order "
+            "account below the threshold, reclaiming it the moment it "
+            "recovers; reorder accounts with cswap move/cswap swap)"
         ),
     )
     parser.add_argument(
