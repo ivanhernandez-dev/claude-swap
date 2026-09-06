@@ -2867,6 +2867,95 @@ class ClaudeAccountSwitcher:
             f"Invalidated session credentials for account {account_num}"
         )
 
+    def _session_profile_ahead(
+        self, account_num: str, email: str, org_uuid: str
+    ) -> str | None:
+        """The session profile's credential when it is a newer generation of
+        this slot's family than the stored backup, else None.
+
+        Claude rotates the token family inside a session profile and the
+        backup never follows, so after any session that refreshed, the backup
+        holds a consumed generation: activated, its first refresh gets
+        invalid_grant. Generations are told apart by fingerprint and ordered
+        by access-token issue time (``expiresAt``: every refresh, and every
+        login, issues a token that expires later than the last), which also
+        keeps a fresh re-login in the backup from reading as drift -- there
+        the backup is the later one.
+
+        Three shapes answer None outright: a profile that an in-session
+        /login re-pointed at another account (a different family, not a
+        newer generation of this one); a profile flagged stale (the backup
+        moved under it while it was live, and cswap has already decided it
+        re-bootstraps); and anything unreadable, because a read error is not
+        evidence of drift.
+        """
+        from claude_swap.session import (
+            is_session_stale,
+            read_session_credentials,
+            session_identity_drifted,
+        )
+
+        session_dir = self._session_dir(account_num, email)
+        if is_session_stale(session_dir):
+            return None
+        profile = read_session_credentials(session_dir)
+        if not profile or session_identity_drifted(session_dir, email, org_uuid):
+            return None
+        backup, unreadable = self._read_account_credentials_ex(account_num, email)
+        if unreadable:
+            return None
+        if oauth.credential_fingerprint(profile) == oauth.credential_fingerprint(
+            backup
+        ):
+            return None
+        issued = oauth.extract_oauth_data(profile) or {}
+        stored = oauth.extract_oauth_data(backup) or {}
+        try:
+            newer = float(issued.get("expiresAt") or 0) > float(
+                stored.get("expiresAt") or 0
+            )
+        except (TypeError, ValueError):
+            return None
+        return profile if newer else None
+
+    def _adopt_session_credential(
+        self, account_num: str, email: str, org_uuid: str
+    ) -> bool:
+        """Capture a quiescent session profile's credential into the slot backup.
+
+        The complement of ``_post_backup_write``: that direction invalidates
+        a profile when the backup moves, this one advances the backup when
+        the profile did. Without it a drifted backup is a landmine -- a
+        switch activates a consumed generation whose first refresh gets
+        invalid_grant, and the collector's backup path POSTs that dead grant
+        and strikes a healthy slot -- and nothing ever defuses it, because
+        the profile keeps passing the local reuse check and is never
+        re-bootstrapped.
+
+        Only while the profile is quiescent: a live claude is rotating that
+        family and owns it. Decided and written under cswap's own lock, since
+        ``_bootstrap`` and the consume gate's persist move the same two
+        copies. The store write is deliberately the pure one:
+        ``_post_backup_write`` would invalidate the very profile just
+        captured, and the two now hold the same generation. Returns whether
+        the backup was advanced.
+        """
+        from claude_swap.session import profile_is_quiescent
+
+        session_dir = self._session_dir(account_num, email)
+        with FileLock(self.lock_file):
+            if not profile_is_quiescent(session_dir):
+                return False
+            profile = self._session_profile_ahead(account_num, email, org_uuid)
+            if profile is None:
+                return False
+            self._store._write_account_credentials(account_num, email, profile)
+        self._logger.info(
+            f"Adopted account {account_num}'s session profile credential "
+            "into its backup"
+        )
+        return True
+
     def _delete_session_profile(self, account_num: str, email: str) -> None:
         """Remove an account's session profile dir and its keychain entry.
 
@@ -4828,12 +4917,13 @@ class ClaudeAccountSwitcher:
 
         # A session profile supersedes the backup copy as this account's
         # credential truth: claude rotates the token family inside the profile
-        # and nothing syncs it back, so once a session has run, the backup's
-        # refresh token is a consumed generation the server 401s forever —
-        # usage would silently freeze at the last pre-session measurement.
-        # Fetch with the profile's newest credential, strictly read-only
-        # (is_active=True: no refresh, no persist): rotating the profile's
-        # family here would log the next `cswap run` out the same way.
+        # and the backup only catches up once the session exits (adopted
+        # below), so while one is live the backup's refresh token is a
+        # consumed generation the server 401s forever — usage would silently
+        # freeze at the last pre-session measurement. Fetch with the profile's
+        # newest credential, strictly read-only (is_active=True: no refresh,
+        # no persist): rotating the profile's family here would log the live
+        # claude out the same way.
         session_dir = self._session_dir(str(num), email)
         session_creds = read_session_credentials(session_dir)
         if session_creds and session_identity_drifted(session_dir, email, org_uuid):
@@ -4849,6 +4939,22 @@ class ClaudeAccountSwitcher:
             )
             session_creds = None
             has_live_session = False
+        if session_creds and not has_live_session:
+            # The session has exited, so its family is nobody's to rotate but
+            # the store's: adopt the profile head into the backup (which is a
+            # consumed generation until then) and take the idle path below,
+            # refresh included, on that credential. A profile already on the
+            # backup's generation, or behind a fresh re-login in the backup,
+            # needs no adoption and takes the same path on the backup. An
+            # adoption refused for any other reason (lock contention, a
+            # session record that could not be read) leaves both copies as
+            # they were.
+            try:
+                if self._adopt_session_credential(str(num), email, org_uuid):
+                    creds = session_creds
+            except LockError:
+                pass
+            session_creds = None
         if session_creds:
             session_oauth = oauth.extract_oauth_data(session_creds)
             if session_oauth and session_oauth.get("accessToken"):
@@ -4861,16 +4967,10 @@ class ClaudeAccountSwitcher:
                         error=outcome.error,
                         retry_after_s=outcome.retry_after_s,
                     )
-                if has_live_session:
-                    # The live claude refreshes lazily on its next API call;
-                    # requesting now would just 401 (same rule as the owned
-                    # active account in _fetch_active_usage).
-                    return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-                # Expired profile credential and no live session: fall through
-                # to the backup path — cswap must not rotate the profile's
-                # family, but a backup family that is still alive (e.g. the
-                # account was re-added after the profile last ran) can serve
-                # and heal via the normal refresh machinery below.
+                # The live claude refreshes lazily on its next API call;
+                # requesting now would just 401 (same rule as the owned
+                # active account in _fetch_active_usage).
+                return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
 
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
@@ -5125,7 +5225,15 @@ class ClaudeAccountSwitcher:
             # strike costs one pass of "re-login needed" on a row that
             # already took AUTH_DEAD_STRIKES invalid_grants; erasing it costs
             # the quarantine itself.
-            return True
+            #
+            # Gated on an actual strike existing (``entry.token_dead()``, no
+            # ``stored_fp`` — we can't verify which generation, so this only
+            # asks whether the count itself has reached threshold): the
+            # first check above already proved the LIVE credential doesn't
+            # carry the struck generation, so a row with zero strikes has
+            # nothing to hold — an unreadable backup on an otherwise-healthy
+            # account must not manufacture "re-login needed" out of nothing.
+            return entry.token_dead()
         return bool(backup) and entry.token_dead(
             stored_fp=oauth.credential_fingerprint(backup)
         )
@@ -6655,31 +6763,60 @@ class ClaudeAccountSwitcher:
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
         """
+        from claude_swap.session import scan_live_sessions
+
         self._refuse_session_shell()
         warnings_out: list[str] = []
-        # Session-mode drift warning (warn, never block): switching the
-        # default login to an account that also has a live session profile
-        # puts the same refresh token in two config dirs — if the server
-        # rotates it, one copy goes stale.
+        # Session-mode drift. Switching the default login to an account that
+        # also has a live session profile puts the same refresh token in two
+        # config dirs — if the server rotates it, one copy goes stale — which
+        # is a warning. But once the profile has already rotated past the
+        # backup, the backup is a consumed generation and activating it is
+        # certain to fail: refuse. With nothing running against the profile
+        # the fix is simpler still — adopt its credential into the backup
+        # first, and the switch activates the live generation.
         pre_data = self._get_sequence_data() or {}
-        pre_email = (
-            pre_data.get("accounts", {}).get(target_account, {}).get("email", "")
-        )
+        pre_account = pre_data.get("accounts", {}).get(target_account, {})
+        pre_email = pre_account.get("email", "")
         if pre_email:
-            pids = self._live_session_pids(target_account, pre_email)
-            if pids:
-                msg = (
-                    f"Account-{target_account} ({pre_email}) has a live session-mode "
-                    f"Claude instance (PID {', '.join(map(str, pids))}). Running the "
-                    "same account as both the default login and a session can make "
-                    "one copy's token go stale if the server rotates it. If the "
-                    "session later fails to authenticate, exit it and re-run "
-                    f"'cswap run {target_account}'."
-                )
-                if emit_output:
-                    warning(msg)
-                else:
-                    warnings_out.append(msg)
+            pre_org = pre_account.get("organizationUuid", "") or ""
+            sessions, unreadable = scan_live_sessions(
+                self._session_dir(target_account, pre_email)
+            )
+            pids = [s.pid for s in sessions]
+            if pids or unreadable:
+                if self._session_profile_ahead(target_account, pre_email, pre_org):
+                    who = (
+                        "a live session-mode Claude instance "
+                        f"(PID {', '.join(map(str, pids))})"
+                        if pids
+                        else f"{unreadable} session record(s) that could not be read"
+                    )
+                    raise SwitchError(
+                        f"Account-{target_account} ({pre_email}) has {who}, and "
+                        "its session profile's credential has rotated past the "
+                        "stored backup: the backup is a consumed generation, and "
+                        "activating it would fail with invalid_grant on its first "
+                        "refresh. Exit the session (its credential is adopted into "
+                        "the backup once nothing runs against it), or switch to "
+                        "another account."
+                    )
+                if pids:
+                    msg = (
+                        f"Account-{target_account} ({pre_email}) has a live "
+                        "session-mode Claude instance "
+                        f"(PID {', '.join(map(str, pids))}). Running the same "
+                        "account as both the default login and a session can make "
+                        "one copy's token go stale if the server rotates it. If the "
+                        "session later fails to authenticate, exit it and re-run "
+                        f"'cswap run {target_account}'."
+                    )
+                    if emit_output:
+                        warning(msg)
+                    else:
+                        warnings_out.append(msg)
+            else:
+                self._adopt_session_credential(target_account, pre_email, pre_org)
 
         # Pre-lock identity resolution (may hit the network — must happen
         # before the locks). Callers that already resolved (self-switch
