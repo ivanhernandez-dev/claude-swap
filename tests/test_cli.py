@@ -1590,7 +1590,7 @@ class TestThresholdCommand:
         self._seeded_switcher_env(temp_home)
         with patch("os.geteuid", return_value=1000, create=True):
             with pytest.raises(SystemExit) as exc:
-                cli._threshold_command(["2", "30"])
+                cli._threshold_command(["2", "0.001"])
         assert exc.value.code == 1
         assert "Error" in capsys.readouterr().err
 

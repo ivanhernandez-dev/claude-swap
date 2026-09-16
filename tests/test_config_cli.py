@@ -144,9 +144,9 @@ class TestConfigSetGet:
 
 class TestConfigValidation:
     def test_out_of_range_exits_1(self, temp_home, capsys):
-        code, _, err = _run(["set", "autoswitch.threshold", "30"], capsys)
+        code, _, err = _run(["set", "autoswitch.threshold", "0.001"], capsys)
         assert code == 1
-        assert "between 50 and 99.9" in err
+        assert "between 0.01 and 99.99" in err
 
     def test_unknown_key_exits_1_and_lists_valid_keys(self, temp_home, capsys):
         code, _, err = _run(["set", "autoswitch.bogus", "1"], capsys)

@@ -723,7 +723,7 @@ Defaults live in settings.json in the backup root; flags override them.
         metavar="PCT",
         help=(
             "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "this utilization (0.01-99.99; default 90)"
         ),
     )
     parser.add_argument(

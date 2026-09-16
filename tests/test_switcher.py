@@ -547,7 +547,7 @@ class TestAccountThresholdCommand:
         self._write(switcher, sample_sequence_data)
 
         with pytest.raises(ValidationError):
-            switcher.set_account_threshold("2", 30.0)
+            switcher.set_account_threshold("2", 0.001)
         with pytest.raises(ValidationError):
             switcher.set_account_threshold("2", 100.0)
 
@@ -557,8 +557,8 @@ class TestAccountThresholdCommand:
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data)
 
-        switcher.set_account_threshold("2", 50.0)
-        switcher.set_account_threshold("2", 99.9)
+        switcher.set_account_threshold("2", 0.01)
+        switcher.set_account_threshold("2", 99.99)
 
     def test_account_threshold_unknown_account_raises(
         self, temp_home: Path, sample_sequence_data: dict

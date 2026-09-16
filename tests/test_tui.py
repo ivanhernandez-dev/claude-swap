@@ -1465,15 +1465,15 @@ class TestAutoScreen:
             screen = app.screen
             await pilot.press("t", "right", "right")
             await pilot.pause()
-            assert screen._settings.threshold == 99.9  # spec's upper bound
+            assert screen._settings.threshold == 99.99  # spec's upper bound
             from textual.widgets import Static
 
             summary = screen.query_one("#auto-summary", Static)
             # never a lying "100%"
-            assert "threshold 99.9% (session)" in summary.render().plain
-            screen.action_threshold_step(-60.0)
+            assert "threshold 99.99% (session)" in summary.render().plain
+            screen.action_threshold_step(-200.0)
             await pilot.pause()
-            assert screen._settings.threshold == 50.0  # spec's lower bound
+            assert screen._settings.threshold == 0.01  # spec's lower bound
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(

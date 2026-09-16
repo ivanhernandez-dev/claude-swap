@@ -69,7 +69,7 @@ class TestLoadSettings:
             }
         }))
         loaded = load_settings(tmp_path)
-        assert loaded.threshold == 99.9
+        assert loaded.threshold == 99.99
         assert loaded.interval_seconds == 15.0  # usage-cache TTL floor
         assert loaded.hysteresis_pct == 0.0
         assert loaded.unhealthy_ticks == 1
@@ -183,7 +183,7 @@ class TestSetUnsetSetting:
             set_setting(tmp_path, "autoswitch.unhealthyTicks", "3.5")
 
     def test_set_rejects_out_of_range_without_writing(self, tmp_path: Path):
-        with pytest.raises(ConfigError, match="between 50 and 99.9"):
+        with pytest.raises(ConfigError, match=r"between 0.01 and 99.99"):
             set_setting(tmp_path, "autoswitch.threshold", "200")
         assert not settings_path(tmp_path).exists()
 
