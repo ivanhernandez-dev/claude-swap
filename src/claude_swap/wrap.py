@@ -215,10 +215,23 @@ class WrapSession:
             self._status(
                 yellowed(f'"{message}" — looking for an account with quota…')
             )
-            if self._try_switch_and_continue():
-                return
+            waited = False
             while not self._stop.is_set():
-                wait_s = self._compute_wait_s()
+                if self._try_switch_and_continue():
+                    return
+                snapshot = self._usage_snapshot()
+                active = self._active_with_quota(snapshot)
+                if active is not None:
+                    if waited:
+                        self._status(accent(f"quota is back on Account-{active}"))
+                        self._resume()
+                    else:
+                        self._status(
+                            f"Account-{active} has quota — not waiting; "
+                            "type 'continue' if the turn stopped"
+                        )
+                    return
+                wait_s = self._compute_wait_s(snapshot)
                 if wait_s is None:
                     wait_s = NO_RESET_FALLBACK_S
                     self._status(
@@ -231,29 +244,56 @@ class WrapSession:
                         f"{_fmt_countdown(wait_s)} — waiting"
                     )
                 self._sleep(wait_s)
-                if self._stop.is_set():
-                    return
-                if self._try_switch_and_continue():
-                    return
+                waited = True
 
     def _sleep(self, seconds: float) -> None:
         """Sleep up to ``seconds``, capped so quota granted early (or a
         re-enabled account) is picked up on the recheck cadence."""
         self._stop.wait(min(seconds, MAX_SLEEP_S))
 
-    def _compute_wait_s(self) -> float | None:
-        """Seconds until the first account's quota returns, or None."""
+    def _usage_snapshot(
+        self,
+    ) -> tuple[dict[str, dict | str | None], str | None] | None:
+        """Usage per account and the active account's number, or None when
+        usage can't be read."""
         try:
             accounts_info = self.switcher._build_accounts_info()
             entries = self.switcher._collect_usage_entries(accounts_info)
         except Exception as e:  # never die waiting
             self._status(yellowed(f"couldn't read usage data ({e!r}); will retry"))
             return None
+        active = next((str(info[0]) for info in accounts_info if info[4]), None)
+        usage = {num: entry.decision_value() for num, entry in entries.items()}
+        return usage, active
+
+    def _active_with_quota(
+        self, snapshot: tuple[dict[str, dict | str | None], str | None] | None
+    ) -> str | None:
+        """The active account's number when it provably has headroom.
+
+        A failed switch then leaves nothing to wait for: the limit already
+        rolled over, something else swapped the credentials underneath, or
+        the match was limit text quoted in the conversation.
+        """
+        if snapshot is None:
+            return None
+        usage, active = snapshot
+        if active is None:
+            return None
+        headroom = oauth.account_headroom(usage.get(active), self.models)
+        if headroom is None or headroom <= 0:
+            return None
+        return active
+
+    def _compute_wait_s(
+        self, snapshot: tuple[dict[str, dict | str | None], str | None] | None
+    ) -> float | None:
+        """Seconds until the first account's quota returns, or None."""
+        if snapshot is None:
+            return None
         switchable = set(self.switcher.switchable_account_numbers())
         usage = {
-            num: entry.decision_value()
-            for num, entry in entries.items()
-            if num in switchable
+            num: value for num, value in snapshot[0].items() if num in switchable
         }
         if not usage:
             return None
@@ -287,14 +327,18 @@ class WrapSession:
         self._status(
             accent(f"switched to Account-{to.get('number')} ({to.get('email')})")
         )
+        self._resume()
+        return True
+
+    def _resume(self) -> None:
+        """Type ``continue`` at the prompt, unless auto-continue is off."""
         if not self.auto_continue:
             self._status("auto-continue off — type 'continue' yourself to resume")
-            return True
+            return
         if self._stop.wait(CONTINUE_DELAY_S):
-            return True
+            return
         self._inject(b"continue\r")
         self._status("resumed (typed 'continue')")
-        return True
 
     def _inject(self, data: bytes) -> None:
         """Type into claude as if the user pressed the keys."""

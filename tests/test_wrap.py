@@ -158,11 +158,25 @@ class TestEarliestRecovery:
 # ---------------------------------------------------------------------------
 
 
-class FakeSwitcher:
-    """Minimal stand-in for ClaudeAccountSwitcher (no real store access)."""
+class _FakeEntry:
+    def __init__(self, value):
+        self._value = value
 
-    def __init__(self, switch_results):
+    def decision_value(self):
+        return self._value
+
+
+class FakeSwitcher:
+    """Minimal stand-in for ClaudeAccountSwitcher (no real store access).
+
+    Account 1 is the active one. ``usage_snapshots`` maps account number to
+    usage, one snapshot per usage read; the last one repeats. With none
+    given, usage is unknown.
+    """
+
+    def __init__(self, switch_results, usage_snapshots=()):
         self._switch_results = list(switch_results)
+        self._usage_snapshots = list(usage_snapshots)
         self.switch_calls = []
 
     def switch(self, strategy=None, json_output=False, models=()):
@@ -170,6 +184,23 @@ class FakeSwitcher:
             {"strategy": strategy, "json_output": json_output, "models": models}
         )
         return self._switch_results.pop(0)
+
+    def _build_accounts_info(self):
+        return [
+            (1, "a@example.com", "", "", True, "", ""),
+            (2, "b@example.com", "", "", False, "", ""),
+        ]
+
+    def _collect_usage_entries(self, accounts_info):
+        if not self._usage_snapshots:
+            return {}
+        snapshot = self._usage_snapshots[0]
+        if len(self._usage_snapshots) > 1:
+            self._usage_snapshots.pop(0)
+        return {num: _FakeEntry(usage) for num, usage in snapshot.items()}
+
+    def switchable_account_numbers(self):
+        return ["1", "2"]
 
 
 def _switched_result(number=2, email="b@example.com"):
@@ -250,7 +281,7 @@ class TestRecovery:
         """First switch finds nothing; after the wait the retry switches."""
         switcher = FakeSwitcher([_noop_result(), _switched_result(number=3)])
         session = _make_session(switcher)
-        session._compute_wait_s = lambda: 0.0  # don't really wait
+        session._compute_wait_s = lambda snapshot: 0.0  # don't really wait
         session._recover("You've hit your session limit")
         assert len(switcher.switch_calls) == 2
         assert session.injected == [b"continue\r"]
@@ -259,11 +290,61 @@ class TestRecovery:
         switcher = FakeSwitcher([_noop_result(), _switched_result()])
         session = _make_session(switcher)
         waits = []
-        session._compute_wait_s = lambda: None
+        session._compute_wait_s = lambda snapshot: None
         orig_sleep = session._sleep
         session._sleep = lambda s: (waits.append(s), orig_sleep(0))[0]
         session._recover("You've hit your session limit")
         assert waits == [wrap.NO_RESET_FALLBACK_S]
+
+    NOW = 1_800_000_000.0
+
+    def _iso(self, delta_s):
+        from datetime import datetime, timezone
+
+        return datetime.fromtimestamp(self.NOW + delta_s, tz=timezone.utc).isoformat()
+
+    def test_active_account_with_quota_ends_recovery(self):
+        """The account in use has headroom, so there is no quota to wait for
+        even though another account is exhausted — and nothing proves the
+        turn was aborted, so nothing is typed."""
+        usage = {
+            "1": _usage(five_hour=_window(7.0, None), seven_day=_window(40.0, None)),
+            "2": _usage(seven_day=_window(100.0, self._iso(56_000))),
+        }
+        switcher = FakeSwitcher([_noop_result("already-best")], [usage])
+        session = _make_session(switcher, clock=lambda: self.NOW)
+
+        def no_sleep(seconds):
+            pytest.fail("waited for quota the active account already has")
+
+        session._sleep = no_sleep
+        session._recover("You've hit your session limit")
+        assert len(switcher.switch_calls) == 1
+        assert session.injected == []
+        assert not any("exhausted" in line for line in session.status_lines)
+
+    def test_waits_then_resumes_on_the_active_account(self, monkeypatch):
+        """Quota returns on the account already in use: there is nothing to
+        switch to, but the aborted turn still has to be resumed."""
+        monkeypatch.setattr(wrap, "CONTINUE_DELAY_S", 0.0)
+        exhausted = {"1": _usage(five_hour=_window(100.0, self._iso(3600)))}
+        recovered = {"1": _usage(five_hour=_window(0.0, None))}
+        switcher = FakeSwitcher(
+            [_noop_result("candidates-exhausted"), _noop_result("already-best")],
+            [exhausted, recovered],
+        )
+        session = _make_session(switcher, clock=lambda: self.NOW)
+        sleeps = []
+
+        def one_sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) > 1:
+                pytest.fail("kept waiting after quota returned")
+
+        session._sleep = one_sleep
+        session._recover("You've hit your session limit")
+        assert len(switcher.switch_calls) == 2
+        assert session.injected == [b"continue\r"]
 
     def test_debounce(self):
         switcher = FakeSwitcher([_switched_result()])
