@@ -90,6 +90,10 @@ def _entry_for(value: dict | str | None, now: float) -> UsageEntry:
 class EngineHarness:
     """Seeded switcher + engine + captured events, on the Linux file backend."""
 
+    # Settings applied under the test's own kwargs; the `legacy_all_over`
+    # marker (see `_legacy_all_over_mode`) puts the hold off here.
+    DEFAULT_SETTINGS: dict = {}
+
     def __init__(self, temp_home: Path, **settings_kwargs):
         self.temp_home = temp_home
         # get_backup_root() (switcher.py) resolves via Path.home() on every
@@ -114,7 +118,9 @@ class EngineHarness:
             self.switcher.platform = Platform.LINUX
             self.switcher._setup_directories()
             self.switcher._init_sequence_file()
-        self.settings = AutoSwitchSettings(**settings_kwargs)
+        self.settings = AutoSwitchSettings(
+            **{**self.DEFAULT_SETTINGS, **settings_kwargs}
+        )
         self.events: list = []
         self.clock = FakeClock()
         # Keep the usage store on the same fake clock as the engine so
@@ -194,6 +200,21 @@ class EngineHarness:
         if not path.exists():
             return {}
         return json.loads(path.read_text())
+
+
+@pytest.fixture(autouse=True)
+def _legacy_all_over_mode(request, monkeypatch):
+    """Tests marked ``legacy_all_over`` pin the pre-hold behavior
+    (``autoswitch.holdWhenAllOverThreshold = false``): with every account
+    over its threshold the engine still moves, ranked by soonest recovery.
+    That mode stays supported, and these tests are its specification; the
+    default (hold on) is covered by ``TestAllOverThresholdHold``."""
+    if request.node.get_closest_marker("legacy_all_over"):
+        monkeypatch.setattr(
+            EngineHarness,
+            "DEFAULT_SETTINGS",
+            {"hold_when_all_over_threshold": False},
+        )
 
 
 @pytest.fixture
@@ -377,6 +398,7 @@ class TestDecisionTable:
         assert switch.trigger == "proactive"
         assert harness.active_number() == 2
 
+    @pytest.mark.legacy_all_over
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
         # threshold 80, hysteresis 5: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold
@@ -3283,6 +3305,7 @@ class TestPriorityStrategy:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "proactive"
 
+    @pytest.mark.legacy_all_over
     def test_at_limit_escape_ranks_by_sequence_order_not_headroom(self, temp_home):
         # Active #1 is fully spent (at-limit escape, which skips the
         # threshold gate entirely). #2 has almost no headroom but is earlier
@@ -3723,6 +3746,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         )
 
 
+@pytest.mark.legacy_all_over
 class TestEveryAccountAboveThreshold:
     """With nothing below the threshold, go to whatever comes back soonest.
 
@@ -3917,6 +3941,7 @@ class TestRecoveryIsUsefulEitherClause:
         )
 
 
+@pytest.mark.legacy_all_over
 class TestRecoveryHorizon:
     """The recovery escape must not spend real headroom on a distant reset.
 
@@ -4089,6 +4114,7 @@ class TestRecoveryHorizon:
         assert harness.active_number() == 2
 
 
+@pytest.mark.legacy_all_over
 class TestTheHorizonDoesNotDiscardWhatItAlreadyKnows:
     """Two regressions from carrying the horizon into the ranking.
 
@@ -4203,6 +4229,7 @@ class TestTheHorizonDoesNotDiscardWhatItAlreadyKnows:
         )
 
 
+@pytest.mark.legacy_all_over
 class TestHorizonAxisDoesNotFlap:
     """Past the horizon the headroom axis needs its own anti-flap margin.
 
@@ -6843,6 +6870,7 @@ class TestTheReleasePredicateOneStateShapePerTest:
                 )
 
 
+@pytest.mark.legacy_all_over
 class TestAllSpentGoesToTheSoonestReset:
     """When every account is spent, sit where the quota comes back first.
 
@@ -7064,6 +7092,7 @@ class TestReviewFindings202:
         }
         assert _binding_recovery_ts(usage, (), now) == float("inf")
 
+    @pytest.mark.legacy_all_over
     def test_at_limit_still_ranks_by_headroom_when_all_are_above(self, harness):
         """The gate was scoped to proactive/consume-first; the KEY was not, so
         at-limit silently re-ranked by soonest-recovery. My earlier at-limit

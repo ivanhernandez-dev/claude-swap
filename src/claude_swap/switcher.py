@@ -309,6 +309,14 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 
 
 
+# Per-account threshold override keys in sequence.json, by ``which``.
+_THRESHOLD_OVERRIDE_KEYS = {
+    "both": "thresholdOverride",
+    "session": "sessionThresholdOverride",
+    "weekly": "weeklyThresholdOverride",
+}
+
+
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
@@ -338,6 +346,10 @@ class ClaudeAccountSwitcher:
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
+        # Weekly threshold pinned alongside ``_poll_inputs_override`` (whose
+        # float is the session/5h one); None = same as the session value.
+        self._poll_weekly_override: float | None = None
+        self._poll_weekly_cache: tuple[float | None, float] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -1053,7 +1065,9 @@ class ClaudeAccountSwitcher:
         ]
         return sorted(rows, key=lambda r: int(r[0]))
 
-    def set_account_threshold(self, identifier: str, value: float) -> tuple[str, float]:
+    def set_account_threshold(
+        self, identifier: str, value: float, which: str = "both"
+    ) -> tuple[str, float]:
         """Set a per-account override of ``autoswitch.threshold`` for the
         account matching identifier.
 
@@ -1061,6 +1075,13 @@ class ClaudeAccountSwitcher:
         ``(account_num, value)``. The bounds mirror the global
         ``autoswitch.threshold`` setting exactly (same spec, single source of
         truth), so a value valid for one is valid for the other.
+
+        ``which`` picks the window class: ``"both"`` (the default, and the
+        only shape before the session/weekly split) sets ``thresholdOverride``
+        and drops any window-specific override so the value really applies
+        to both; ``"session"`` / ``"weekly"`` set only that one
+        (``sessionThresholdOverride`` / ``weeklyThresholdOverride``), which
+        wins over ``thresholdOverride`` for its windows.
 
         Raises:
             AccountNotFoundError: identifier doesn't match any account.
@@ -1084,18 +1105,27 @@ class ClaudeAccountSwitcher:
         if not record:
             raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        record["thresholdOverride"] = value
+        if which not in _THRESHOLD_OVERRIDE_KEYS:
+            raise ValidationError(f"Unknown threshold kind: {which}")
+        if which == "both":
+            record["thresholdOverride"] = value
+            for key in ("sessionThresholdOverride", "weeklyThresholdOverride"):
+                record.pop(key, None)
+        else:
+            record[_THRESHOLD_OVERRIDE_KEYS[which]] = value
         data["lastUpdated"] = get_timestamp()
         self._write_json(self.sequence_file, data)
         return account_num, value
 
-    def unset_account_threshold(self, identifier: str) -> str:
+    def unset_account_threshold(self, identifier: str, which: str = "both") -> str:
         """Clear the per-account threshold override for the account matching
         identifier.
 
         Returns the account number. Idempotent: clearing an already-unset
         override succeeds silently, matching ``unset_alias``'s posture of
-        "the end state is what you asked for".
+        "the end state is what you asked for". ``which="both"`` clears every
+        override (shared and window-specific); ``"session"``/``"weekly"``
+        clear only that window-specific one.
 
         Raises:
             AccountNotFoundError: identifier doesn't match any account.
@@ -1112,8 +1142,17 @@ class ClaudeAccountSwitcher:
         if not record:
             raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        if "thresholdOverride" in record:
-            del record["thresholdOverride"]
+        if which not in _THRESHOLD_OVERRIDE_KEYS:
+            raise ValidationError(f"Unknown threshold kind: {which}")
+        keys = (
+            tuple(_THRESHOLD_OVERRIDE_KEYS.values())
+            if which == "both"
+            else (_THRESHOLD_OVERRIDE_KEYS[which],)
+        )
+        present = [key for key in keys if key in record]
+        if present:
+            for key in present:
+                del record[key]
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
         return account_num
@@ -1129,6 +1168,50 @@ class ClaudeAccountSwitcher:
             if acc.get("thresholdOverride") is not None
         ]
         return sorted(rows, key=lambda r: int(r[0]))
+
+    def list_account_threshold_overrides(
+        self,
+    ) -> list[tuple[str, float | None, float | None, float | None, str]]:
+        """Every account with any threshold override as ``(account_num,
+        shared, session, weekly, email)`` (None where that one is unset),
+        slot-number order."""
+        data = self._get_sequence_data_migrated()
+        accounts = (data or {}).get("accounts", {})
+        rows = []
+        for num, acc in accounts.items():
+            values = tuple(
+                acc.get(key) for key in _THRESHOLD_OVERRIDE_KEYS.values()
+            )
+            if any(v is not None for v in values):
+                rows.append((num, *values, acc.get("email", "")))
+        return sorted(rows, key=lambda r: int(r[0]))
+
+    def account_threshold_overrides(
+        self, account_num: str
+    ) -> tuple[float | None, float | None]:
+        """This account's own ``(session, weekly)`` threshold overrides: the
+        window-specific one when set, else the shared ``thresholdOverride``,
+        else None (use the fleet setting)."""
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num)) or {}
+        shared = record.get("thresholdOverride")
+        session = record.get("sessionThresholdOverride")
+        weekly = record.get("weeklyThresholdOverride")
+        return (
+            session if session is not None else shared,
+            weekly if weekly is not None else shared,
+        )
+
+    def _window_threshold_overrides(self, account_num: str) -> dict[str, float]:
+        """Only the window-specific overrides that are set, as
+        ``{"session"|"weekly": pct}`` (display / JSON helper)."""
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num)) or {}
+        return {
+            which: record[key]
+            for which, key in _THRESHOLD_OVERRIDE_KEYS.items()
+            if which != "both" and record.get(key) is not None
+        }
 
     def account_threshold_override(self, account_num: str) -> float | None:
         """This account's own ``autoswitch.threshold`` override, or ``None``
@@ -1882,12 +1965,18 @@ class ClaudeAccountSwitcher:
         }
 
     def set_poll_policy_inputs(
-        self, threshold: float, models: tuple[str, ...]
+        self,
+        threshold: float,
+        models: tuple[str, ...],
+        weekly_threshold: float | None = None,
     ) -> None:
         """Pin the threshold/models poll planning keys on (set by a hosted
         auto engine so cadence follows its effective, CLI-merged settings
-        instead of the settings file)."""
+        instead of the settings file). ``threshold`` is the session (5h)
+        threshold; ``weekly_threshold`` (None = the same) gates the 7d and
+        per-model windows."""
         self._poll_inputs_override = (threshold, models)
+        self._poll_weekly_override = weekly_threshold
 
     def clear_poll_policy_inputs(self) -> None:
         """Drop the hosted engine's pin so poll planning falls back to the
@@ -1895,6 +1984,7 @@ class ClaudeAccountSwitcher:
         session threshold override would keep steering cadence after the
         engine it belonged to is gone."""
         self._poll_inputs_override = None
+        self._poll_weekly_override = None
 
     def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...]]:
         """Threshold + configured model names for poll planning: the hosting
@@ -1910,9 +2000,22 @@ class ClaudeAccountSwitcher:
         if self._poll_inputs_cache is not None and self._poll_inputs_cache[0] == mtime:
             return self._poll_inputs_cache[1]
         loaded = load_settings(self.backup_dir)
-        inputs = (loaded.threshold, parse_model_names(loaded.model))
+        inputs = (loaded.effective_session_threshold, parse_model_names(loaded.model))
         self._poll_inputs_cache = (mtime, inputs)
+        self._poll_weekly_cache = (mtime, loaded.effective_weekly_threshold)
         return inputs
+
+    def _poll_policy_weekly_threshold(self) -> float:
+        """The weekly threshold paired with :meth:`_poll_policy_inputs`'s
+        (session) one: the pinned value when an engine pinned one, else the
+        settings file's effective weekly threshold."""
+        session, _models = self._poll_policy_inputs()
+        if self._poll_inputs_override is not None:
+            weekly = self._poll_weekly_override
+            return session if weekly is None else weekly
+        if self._poll_weekly_cache is not None:
+            return self._poll_weekly_cache[1]
+        return session
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
@@ -5293,6 +5396,7 @@ class ClaudeAccountSwitcher:
         """
         now = self._usage_store.clock()
         threshold, models = self._poll_policy_inputs()
+        weekly_threshold = self._poll_policy_weekly_threshold()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
             if rec.sentinel is not None or rec.error is not None:
@@ -5303,15 +5407,16 @@ class ClaudeAccountSwitcher:
             # urgent-mode cadence too, not just the switch decision — falls
             # back to the fleet default (already CLI-merged by
             # _poll_policy_inputs) when unset.
-            acct_threshold = self.account_threshold_override(num)
-            if acct_threshold is None:
-                acct_threshold = threshold
+            acct_session, acct_weekly = self.account_threshold_overrides(num)
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,
                 prev_usage=before.last_good if before else None,
                 new_usage=rec.usage,
                 is_active=bool(info_by_num[num][4]),
-                threshold=acct_threshold,
+                threshold=threshold if acct_session is None else acct_session,
+                weekly_threshold=(
+                    weekly_threshold if acct_weekly is None else acct_weekly
+                ),
                 models=models,
                 recent_429=recent_429,
                 now=now,
@@ -5599,6 +5704,9 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     threshold_override=self.account_threshold_override(str(num)),
+                    window_threshold_overrides=self._window_threshold_overrides(
+                        str(num)
+                    ),
                     login_expires_at=oauth.login_expires_at_iso(creds),
                 )
             )
@@ -5667,6 +5775,9 @@ class ClaudeAccountSwitcher:
             threshold_override = self.account_threshold_override(str(num))
             if threshold_override is not None:
                 markers += f" {muted(f'(threshold {threshold_override:g}%)')}"
+            for label, value in self._window_threshold_overrides(str(num)).items():
+                window = "5h" if label == "session" else "weekly"
+                markers += f" {muted(f'({window} threshold {value:g}%)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
@@ -6307,13 +6418,19 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        log_detail: str = "",
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+        ``log_detail`` is appended to the ``Switched from account X to Y`` log
+        line (the auto engine passes its trigger and the 5h/7d figures).
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -6412,6 +6529,7 @@ class ClaudeAccountSwitcher:
             emit_output=not json_output,
             force_activate=force,
             provenance=provenance,
+            **({"log_detail": log_detail} if log_detail else {}),
         )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
@@ -6798,6 +6916,7 @@ class ClaudeAccountSwitcher:
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        log_detail: str = "",
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -7326,6 +7445,7 @@ class ClaudeAccountSwitcher:
 
                 self._logger.info(
                     f"Switched from account {current_account} to {target_account}"
+                    + (f" ({log_detail})" if log_detail else "")
                 )
 
             except Exception as e:

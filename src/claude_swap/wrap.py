@@ -21,6 +21,13 @@ messages. On a hit it:
    (5h, 7d, and configured per-model scoped windows), then the minimum
    across accounts, mirroring ``AutoSwitchEngine._earliest_recovery`` —
    shows a countdown, sleeps, and switches + continues when quota returns.
+4. With ``autoswitch.holdWhenAllOverThreshold`` (the CLI wires it from
+   settings), when every OTHER account is over its switch threshold too
+   (5h >= sessionThreshold or any weekly window >= weeklyThreshold), it does
+   not rotate onto them — that only burns the next nearly-spent account.
+   It waits instead until some account drops back under its thresholds
+   (typically a 5h reset), then resumes there: the same rule ``cswap auto``
+   follows.
 
 The wrapper never parses or rewrites claude's arguments: everything after
 ``cswap wrap`` (optionally separated by ``--``) is passed through verbatim,
@@ -166,8 +173,15 @@ class WrapSession:
         claude_bin: str = "claude",
         clock: Callable[[], float] = time.time,
         out: Callable[[str], None] | None = None,
+        thresholds_for: Callable[[str], tuple[float, float]] | None = None,
+        hold_when_all_over: bool = False,
     ):
         self.switcher = switcher
+        # ``thresholds_for(num) -> (session, weekly)``; the all-over-threshold
+        # hold only applies when both are given (the CLI passes them from
+        # settings + per-account overrides).
+        self.thresholds_for = thresholds_for
+        self.hold_when_all_over = hold_when_all_over and thresholds_for is not None
         self.claude_args = list(claude_args)
         self.strategy = strategy
         self.models = tuple(models)
@@ -216,7 +230,61 @@ class WrapSession:
                 yellowed(f'"{message}" — looking for an account with quota…')
             )
             waited = False
+            holding = False
             while not self._stop.is_set():
+                if self.hold_when_all_over:
+                    snapshot = self._usage_snapshot()
+                    verdict = self._hold_verdict(snapshot)
+                    if verdict is not None:
+                        active, active_headroom, release_ts = verdict
+                        if active_headroom > 0:
+                            # Usage says the active account still has quota
+                            # (an unwatched per-model limit, or limit text
+                            # quoted in the conversation): nothing to wait
+                            # for, and nowhere under threshold to go.
+                            self._status(
+                                f"Account-{active} still has quota and every "
+                                "other account is over its threshold — not "
+                                "switching; type 'continue' if the turn stopped"
+                            )
+                            return
+                        if not holding:
+                            when = (
+                                time.strftime(
+                                    "%H:%M", time.localtime(release_ts)
+                                )
+                                if release_ts is not None
+                                else "a window resets (time unknown)"
+                            )
+                            self._status(
+                                yellowed(
+                                    "all accounts are over their threshold: "
+                                    f"holding on Account-{active} until {when}"
+                                )
+                            )
+                            holding = True
+                        now = self.clock()
+                        wait_s = (
+                            release_ts - now + poll_policy.RESET_SLACK_S
+                            if release_ts is not None
+                            else NO_RESET_FALLBACK_S
+                        )
+                        self._sleep(max(wait_s, 1.0))
+                        waited = True
+                        continue
+                    if holding and snapshot is None:
+                        # Usage unreadable this round: that is no evidence
+                        # the hold is over — keep waiting, don't rotate.
+                        self._sleep(NO_RESET_FALLBACK_S)
+                        continue
+                    if holding:
+                        holding = False
+                        self._status(accent("hold over: an account is back under its threshold"))
+                        back = self._active_under_threshold(snapshot)
+                        if back is not None:
+                            self._status(accent(f"quota is back on Account-{back}"))
+                            self._resume()
+                            return
                 if self._try_switch_and_continue():
                     return
                 snapshot = self._usage_snapshot()
@@ -284,6 +352,74 @@ class WrapSession:
         if headroom is None or headroom <= 0:
             return None
         return active
+
+    def _hold_verdict(
+        self, snapshot: tuple[dict[str, dict | str | None], str | None] | None
+    ) -> tuple[str, float, float | None] | None:
+        """``(active, active_headroom, release_ts)`` when the all-over-
+        threshold hold applies, else None.
+
+        Applies when the active account is measured and over its thresholds,
+        every measured switchable candidate is over its own, at least one was
+        measured, and at least one still has headroom — with all of them at
+        their hard limit there is nothing to hold back from and the
+        all-exhausted wait below handles it. ``release_ts`` is the earliest
+        moment any of these accounts drops back under its thresholds.
+        """
+        if snapshot is None or self.thresholds_for is None:
+            return None
+        usage, active = snapshot
+        if active is None:
+            return None
+        active_value = usage.get(active)
+        if not isinstance(active_value, dict):
+            return None
+        active_headroom = oauth.account_headroom(active_value, self.models)
+        if active_headroom is None or not self._over(active, active_value):
+            return None
+        switchable = [
+            n for n in self.switcher.switchable_account_numbers() if n != active
+        ]
+        measured = [n for n in switchable if isinstance(usage.get(n), dict)]
+        verdicts = [self._over(n, usage[n]) for n in measured]
+        if not verdicts or not all(v is True for v in verdicts):
+            return None
+        if not any(
+            (oauth.account_headroom(usage[n], self.models) or 0.0) > 0
+            for n in measured
+        ):
+            return None
+        now = self.clock()
+        release: float | None = None
+        for num in [active, *measured]:
+            session, weekly = self.thresholds_for(num)
+            ts = poll_policy.under_threshold_at(
+                usage[num], self.models, session, weekly, now
+            )
+            if ts is not None and (release is None or ts < release):
+                release = ts
+        return active, active_headroom, release
+
+    def _over(self, num: str, value: dict | str | None) -> bool | None:
+        """5h >= session OR any weekly window >= weekly (None = unknown)."""
+        if self.thresholds_for is None:
+            return None
+        session, weekly = self.thresholds_for(num)
+        gap = oauth.threshold_gap(
+            value if isinstance(value, dict) else None, self.models, session, weekly
+        )
+        return None if gap is None else gap >= 0
+
+    def _active_under_threshold(
+        self, snapshot: tuple[dict[str, dict | str | None], str | None] | None
+    ) -> str | None:
+        """The active account's number when it is back under its thresholds."""
+        if snapshot is None:
+            return None
+        usage, active = snapshot
+        if active is None:
+            return None
+        return active if self._over(active, usage.get(active)) is False else None
 
     def _compute_wait_s(
         self, snapshot: tuple[dict[str, dict | str | None], str | None] | None

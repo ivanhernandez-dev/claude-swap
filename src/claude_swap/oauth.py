@@ -594,6 +594,38 @@ def account_headroom(
     return 100.0 - max(pcts)
 
 
+def window_threshold(label: str, session: float, weekly: float) -> float:
+    """The threshold that gates one :func:`relevant_windows` label: the
+    session threshold for the 5-hour window, the weekly one for everything
+    else (7d and the per-model weekly windows)."""
+    return session if label == "5h" else weekly
+
+
+def threshold_gap(
+    usage: dict | None,
+    models: Sequence[str],
+    session_threshold: float,
+    weekly_threshold: float,
+) -> float | None:
+    """How far this account sits past its switch threshold, in points.
+
+    ``max(pct - threshold)`` over the windows that gate it, each window
+    measured against its own threshold (:func:`window_threshold`). ``>= 0``
+    means the account is OVER its threshold (5h >= session or any weekly
+    window >= weekly); ``-15`` means the closest window is 15 points short.
+    With both thresholds equal this is exactly ``binding pct - threshold``,
+    the comparison the engine made before the split. None when usage is
+    unknown or carries no window data.
+    """
+    windows = relevant_windows(usage, models)
+    if not windows:
+        return None
+    return max(
+        pct - window_threshold(label, session_threshold, weekly_threshold)
+        for label, pct, _ in windows
+    )
+
+
 @dataclass(frozen=True)
 class UsageOutcome:
     """Result of a usage-API fetch attempt.

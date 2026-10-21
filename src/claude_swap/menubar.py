@@ -718,6 +718,12 @@ def run(switcher) -> int:
                     rumps.notification("claude-swap", "Account quarantined", ev.human())
                 elif ev.kind == "all-exhausted":
                     rumps.notification("claude-swap", "All accounts exhausted", ev.human())
+                elif ev.kind == "hold":
+                    # Announced once on entering (not every tick): the engine
+                    # deliberately stays on the active account.
+                    rumps.notification(
+                        "claude-swap", "All accounts over threshold", ev.human()
+                    )
                 elif ev.kind == "config-warning":
                     # e.g. an autoswitch.model name no account reports — the
                     # engine emits it once per run; dropping it would leave a
@@ -730,6 +736,16 @@ def run(switcher) -> int:
                 return int(load_settings(self.switcher.backup_dir).threshold)
             except Exception:
                 return 0
+
+        def _split_thresholds(self) -> tuple[float, float] | None:
+            """(session, weekly) when they differ, else None (one threshold)."""
+            try:
+                loaded = load_settings(self.switcher.backup_dir)
+            except Exception:
+                return None
+            session = loaded.effective_session_threshold
+            weekly = loaded.effective_weekly_threshold
+            return (session, weekly) if session != weekly else None
 
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
@@ -872,7 +888,14 @@ def run(switcher) -> int:
             auto_item.state = 1 if self.settings.auto_switch_enabled else 0
             menu.add(auto_item)
 
-            threshold_menu = rumps.MenuItem("Auto-switch threshold")
+            title = "Auto-switch threshold"
+            split = self._split_thresholds()
+            if split:
+                # autoswitch.sessionThreshold / weeklyThreshold are set: the
+                # entries below change autoswitch.threshold, which those
+                # override — say so instead of pretending one value rules.
+                title += f" (5h {split[0]:g}% / weekly {split[1]:g}%)"
+            threshold_menu = rumps.MenuItem(title)
             current = self._threshold()
             for pct in AUTO_THRESHOLD_CHOICES:
                 ch = rumps.MenuItem(f"{pct}%", callback=self._make_threshold(pct))

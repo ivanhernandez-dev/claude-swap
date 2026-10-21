@@ -167,8 +167,12 @@ def account_card_text(
     threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    weekly_threshold: float | None = None,
 ) -> Text:
-    """The full account card: header line + per-window bar rows."""
+    """The full account card: header line + per-window bar rows.
+
+    ``threshold`` ticks the 5h (and spend) rows; ``weekly_threshold``, when
+    given, ticks the 7d and per-model rows instead (split thresholds)."""
     now = now if now is not None else time.time()
 
     text = Text()
@@ -233,7 +237,11 @@ def account_card_text(
                 suffix or None,
                 bar_width,
                 stale=stale,
-                threshold=threshold,
+                threshold=(
+                    weekly_threshold
+                    if weekly_threshold is not None and label not in ("5h", "$$")
+                    else threshold
+                ),
                 palette=palette,
             )
         )
@@ -341,6 +349,7 @@ class AccountsPanel(Static):
                     account_card_text(
                         acc, width, threshold=app.threshold_pct, now=now,
                         palette=palette,
+                        weekly_threshold=getattr(app, "weekly_threshold_pct", None),
                     )
                 )
             elif self._show_minis:
