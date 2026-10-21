@@ -133,7 +133,7 @@ cswap wrap --model Fable          # also watch per-model weekly limits
 cswap wrap --no-auto-continue     # switch accounts, but don't type 'continue'
 ```
 
-With `autoswitch.holdWhenAllOverThreshold` on (the default), wrap follows the same rule as `cswap auto`: if every other account is over its threshold too, it does not rotate onto one of them; it holds on the current account, prints when the first account will be back under its thresholds, and switches (or resumes on the same account, if that is the one that reset) once one is. `--no-hold-when-all-over-threshold` restores rotating.
+With `autoswitch.holdWhenAllOverThreshold` on (the default), wrap follows the same rule as `cswap auto`: if every other account is over its threshold too, it does not rotate onto one of them; it holds on the current account, prints when the first account will be back under its thresholds, and switches (or resumes on the same account, if that is the one that reset) once one is. With the hold on, wrap only ever switches to an account that is under its thresholds (the one with most quota left among those), never one merely "less spent". `--no-hold-when-all-over-threshold` restores rotating. Every wrap switch is recorded in the auto-switch state file, so a `cswap auto` running alongside counts it toward its cooldown.
 
 When **every** account is exhausted, wrap computes the earliest moment any account gets quota back — per account the latest reset among its exhausted windows (5h, 7d, and configured per-model windows), then the soonest across accounts — prints a countdown, sleeps, and switches + resumes when the first account recovers. It re-checks on a bounded cadence, so quota granted early (or an account you re-enable meanwhile) is picked up.
 

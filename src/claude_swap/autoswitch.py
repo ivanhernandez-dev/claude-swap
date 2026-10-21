@@ -746,6 +746,92 @@ def _every_account_above_threshold(
     return all((100.0 - h) >= threshold_for(n) for n, h in measured)
 
 
+def window_figures(value: dict | str | None, models: Sequence[str] = ()) -> str:
+    """``5h 97% · 7d 41%`` (plus configured per-model windows) for switch
+    log lines; ``?`` when unknown. Shared by the engine and ``cswap wrap``."""
+    pcts = _window_pcts(value if isinstance(value, dict) else None, tuple(models))
+    if not pcts:
+        return "?"
+    return " · ".join(f"{name} {pct:.0f}%" for name, pct in pcts.items())
+
+
+def apply_switch_record(
+    state: dict,
+    *,
+    now: float,
+    to_number: str,
+    from_number: int | str | None,
+    left: tuple[float | None, float],
+    trigger: str,
+) -> None:
+    """Record a completed switch in the autoswitch state dict (in place).
+
+    ``lastSwitchAt`` drives the cooldown; ``lastSwitchTo`` /
+    ``lastSwitchFrom`` + the departure snapshot (``leftHeadroom``,
+    ``leftRecoveryAt``) and ``leftTrigger`` feed the no-return bar.
+    """
+    state["schemaVersion"] = STATE_SCHEMA_VERSION
+    state["lastSwitchAt"] = now
+    state["lastSwitchTo"] = str(to_number)
+    # WHERE we came from, so the next tick can refuse to undo this,
+    # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
+    # cannot fake. See `_left_account_recovered` for why the present
+    # state alone cannot supply one. `inf` is stored as null: it is not
+    # portable JSON, and every other reader of this file would have to
+    # learn about it.
+    state["lastSwitchFrom"] = from_number
+    state["leftHeadroom"], recovery = left
+    state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
+    # A `consume-first` phase-2 refetch can write the SAME (None,
+    # None) shape a `failover` departure writes, whenever the
+    # refetched active row has a `pct` but is otherwise unmeasurable
+    # in the same tick its weekly reset is known --
+    # `account_headroom` needs a numeric `pct`, `_seven_day_reset_ts`
+    # needs only `resets_at`. Inferring the trigger from the two
+    # nulls then runs the wrong legs. Record it directly so the
+    # reader never has to guess.
+    state["leftTrigger"] = trigger
+
+
+def record_external_switch(
+    backup_dir: Path,
+    *,
+    now: float,
+    to_number: str,
+    from_number: int | str | None,
+    from_usage: dict | str | None,
+    models: Sequence[str] = (),
+    trigger: str = "at-limit",
+) -> None:
+    """Record a switch made OUTSIDE the engine (``cswap wrap``) in
+    ``autoswitch_state.json``, under the engine's own state lock, so a
+    running ``cswap auto`` counts it for its cooldown and its no-return bar
+    exactly like one of its own. ``trigger`` is how the engine should read
+    the departure: a wrap switch is an escape from an account that hit its
+    limit, i.e. ``at-limit``."""
+    headroom = oauth.account_headroom(
+        from_usage if isinstance(from_usage, dict) else None, tuple(models)
+    )
+    left = (headroom, _binding_recovery_ts(from_usage, tuple(models), now))
+    state_path = backup_dir / STATE_FILENAME
+    with FileLock(backup_dir / ".autoswitch_state.lock"):
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        apply_switch_record(
+            state,
+            now=now,
+            to_number=to_number,
+            from_number=from_number,
+            left=left,
+            trigger=trigger,
+        )
+        atomic_write_json(state_path, state)
+
+
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
 
@@ -1018,12 +1104,9 @@ class AutoSwitchEngine:
         )
 
     def _figures(self, value: dict | str | None) -> str:
-        """``5h 97% · 7d 41%`` (plus configured per-model windows) for the
-        switch log line; ``?`` when unknown."""
-        pcts = _window_pcts(value if isinstance(value, dict) else None, self._models)
-        if not pcts:
-            return "?"
-        return " · ".join(f"{name} {pct:.0f}%" for name, pct in pcts.items())
+        """``5h 97% · 7d 41%`` for the switch log line (see
+        ``window_figures``)."""
+        return window_figures(value, self._models)
 
     def _release_ts(
         self, accounts: Sequence[str], usage: dict[str, dict | str | None]
@@ -2673,27 +2756,14 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.NO_ACTION
 
-            state["schemaVersion"] = STATE_SCHEMA_VERSION
-            state["lastSwitchAt"] = self.clock()
-            state["lastSwitchTo"] = number
-            # WHERE we came from, so the next tick can refuse to undo this,
-            # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
-            # cannot fake. See `_left_account_recovered` for why the present
-            # state alone cannot supply one. `inf` is stored as null: it is not
-            # portable JSON, and every other reader of this file would have to
-            # learn about it.
-            state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
-            state["leftHeadroom"], recovery = left
-            state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
-            # A `consume-first` phase-2 refetch can write the SAME (None,
-            # None) shape a `failover` departure writes, whenever the
-            # refetched active row has a `pct` but is otherwise unmeasurable
-            # in the same tick its weekly reset is known --
-            # `account_headroom` needs a numeric `pct`, `_seven_day_reset_ts`
-            # needs only `resets_at`. Inferring the trigger from the two
-            # nulls then runs the wrong legs. Record it directly so the
-            # reader never has to guess.
-            state["leftTrigger"] = trigger
+            apply_switch_record(
+                state,
+                now=self.clock(),
+                to_number=number,
+                from_number=(result.get("from") or {}).get("number"),
+                left=left,
+                trigger=trigger,
+            )
             atomic_write_json(self.state_path, state)
 
         self._emit(

@@ -49,6 +49,7 @@ import tty
 from collections.abc import Callable, Sequence
 
 from claude_swap import oauth, poll_policy
+from claude_swap.autoswitch import record_external_switch, window_figures
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.printer import accent, dimmed, yellowed
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -280,6 +281,9 @@ class WrapSession:
                     if holding:
                         holding = False
                         self._status(accent("hold over: an account is back under its threshold"))
+                    if waited:
+                        # After a wait, the account in use coming back under
+                        # its thresholds is the cheapest place to resume.
                         back = self._active_under_threshold(snapshot)
                         if back is not None:
                             self._status(accent(f"quota is back on Account-{back}"))
@@ -305,6 +309,11 @@ class WrapSession:
                     self._status(
                         "all accounts exhausted and no reset time is known; "
                         f"re-checking every {_fmt_countdown(wait_s)}"
+                    )
+                elif self.hold_when_all_over:
+                    self._status(
+                        "no account under its threshold; the first is back in "
+                        f"{_fmt_countdown(wait_s)} — waiting"
                     )
                 else:
                     self._status(
@@ -435,20 +444,92 @@ class WrapSession:
             return None
         now = self.clock()
         ts = earliest_recovery_ts(usage, self.models, now)
+        if self.hold_when_all_over:
+            # With the hold on, waiting ends when some account is back under
+            # its thresholds (its quota returning is a special case of that).
+            release = self._threshold_release_ts(usage, now)
+            if release is not None and release > now:
+                ts = release if ts is None else min(ts, release)
         if ts is None:
             return None
         return ts - now + poll_policy.RESET_SLACK_S
+
+    def _threshold_release_ts(
+        self, usage: dict[str, dict | str | None], now: float
+    ) -> float | None:
+        """Earliest moment any of these accounts drops back under its
+        thresholds (None when none can prove it)."""
+        if self.thresholds_for is None:
+            return None
+        release: float | None = None
+        for num, value in usage.items():
+            if not isinstance(value, dict):
+                continue
+            session, weekly = self.thresholds_for(num)
+            ts = poll_policy.under_threshold_at(
+                value, self.models, session, weekly, now
+            )
+            if ts is not None and (release is None or ts < release):
+                release = ts
+        return release
+
+    def _under_threshold_target(
+        self, snapshot: tuple[dict[str, dict | str | None], str | None] | None
+    ) -> str | None:
+        """With the hold on: the switchable account (not the active one)
+        that is UNDER its thresholds and has the most headroom, or None.
+
+        ``switch(strategy="best")`` ranks on headroom alone, which with
+        different session/weekly thresholds can pick an account still over
+        one of them — the move the hold exists to prevent. Ties go to
+        rotation order.
+        """
+        if snapshot is None:
+            return None
+        usage, active = snapshot
+        best: tuple[float, str] | None = None
+        for num in self.switcher.switchable_account_numbers():
+            if num == active or self._over(num, usage.get(num)) is not False:
+                continue
+            headroom = oauth.account_headroom(usage.get(num), self.models)
+            if headroom is None or headroom <= 0:
+                continue
+            if best is None or headroom > best[0]:
+                best = (headroom, num)
+        return best[1] if best else None
 
     def _try_switch_and_continue(self) -> bool:
         """Switch to the best account with headroom; resume the turn.
 
         Returns True when the active account changed and ``continue`` was
-        (or, with --no-auto-continue, was not) queued at the prompt.
+        (or, with --no-auto-continue, was not) queued at the prompt. With the
+        hold on, only an account under its thresholds qualifies (see
+        ``_under_threshold_target``); the switch is recorded in
+        ``autoswitch_state.json`` so ``cswap auto`` shares its cooldown.
         """
+        snapshot = None
         try:
-            result = self.switcher.switch(
-                strategy=self.strategy, json_output=True, models=self.models
-            )
+            if self.hold_when_all_over:
+                snapshot = self._usage_snapshot()
+                target = self._under_threshold_target(snapshot)
+                if target is None:
+                    self._status("no switch: no account is under its threshold")
+                    return False
+                usage, active = snapshot
+                result = self.switcher.switch_to(
+                    target,
+                    json_output=True,
+                    log_detail=(
+                        f"wrap at-limit; from #{active} "
+                        f"{window_figures(usage.get(active), self.models)} -> "
+                        f"to #{target} "
+                        f"{window_figures(usage.get(target), self.models)}"
+                    ),
+                )
+            else:
+                result = self.switcher.switch(
+                    strategy=self.strategy, json_output=True, models=self.models
+                )
         except ClaudeSwitchError as e:
             self._status(yellowed(f"switch failed: {e}"))
             return False
@@ -460,11 +541,41 @@ class WrapSession:
             self._status(f"no switch: {reason}")
             return False
         to = result.get("to") or {}
+        self._record_switch(result, snapshot)
         self._status(
             accent(f"switched to Account-{to.get('number')} ({to.get('email')})")
         )
         self._resume()
         return True
+
+    def _record_switch(
+        self,
+        result: dict,
+        snapshot: tuple[dict[str, dict | str | None], str | None] | None,
+    ) -> None:
+        """Write the switch into ``autoswitch_state.json`` (lastSwitchAt /
+        lastSwitchTo / departure snapshot) so a ``cswap auto`` running
+        alongside counts it for its cooldown. Best-effort: bookkeeping must
+        never break the recovery."""
+        backup_dir = getattr(self.switcher, "backup_dir", None)
+        to_number = (result.get("to") or {}).get("number")
+        if backup_dir is None or to_number is None:
+            return
+        from_number = (result.get("from") or {}).get("number")
+        try:
+            if snapshot is None:
+                snapshot = self._usage_snapshot()
+            usage = snapshot[0] if snapshot else {}
+            record_external_switch(
+                backup_dir,
+                now=self.clock(),
+                to_number=str(to_number),
+                from_number=from_number,
+                from_usage=usage.get(str(from_number)) if from_number else None,
+                models=self.models,
+            )
+        except Exception as e:  # never let the record break the resume
+            self._status(dimmed(f"couldn't record the switch for cswap auto ({e!r})"))
 
     def _resume(self) -> None:
         """Type ``continue`` at the prompt, unless auto-continue is off."""
