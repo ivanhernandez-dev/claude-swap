@@ -87,6 +87,7 @@ Let claude-swap watch your usage and switch for you. When the active account's 5
 ```bash
 cswap auto                     # foreground loop, polls every 60s
 cswap auto --threshold 80      # switch earlier
+cswap auto --session-threshold 85 --weekly-threshold 95   # separate 5h / weekly limits
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
@@ -98,9 +99,12 @@ cswap auto --strategy priority        # always run the earliest healthy account,
 <summary>How it behaves & advanced usage</summary>
 
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
+- **Session and weekly thresholds**: `autoswitch.sessionThreshold` applies to the 5-hour window and `autoswitch.weeklyThreshold` to the 7-day window plus any per-model weekly windows you watch (`autoswitch.model`). Both default to `autoswitch.threshold`, so setting neither changes nothing. An account counts as **over its threshold** when its 5h window reaches the session threshold **or** any weekly window reaches the weekly one — that is what triggers a switch, and a switch only lands on an account that is under both. E.g. `cswap config set autoswitch.sessionThreshold 85` + `cswap config set autoswitch.weeklyThreshold 95` switches early on short bursts but lets the weekly quota run nearly to the end. `cswap auto --threshold N` (one-off) sets both; `--session-threshold` / `--weekly-threshold` set one.
+- **When every account is over its threshold, it waits instead of rotating** (`autoswitch.holdWhenAllOverThreshold`, on by default): if the active account *and* every other measured account are over their thresholds, it stays on the active one — no proactive move, and no escape at the hard limit either — and re-checks on the slow cadence until some account drops back under (typically when a 5-hour window resets); then it switches by the normal rules. It logs one line on entering the hold (`all accounts are over their threshold: holding on Account-N until 14:05`) and one when it ends. Without this, a fleet of nearly-spent accounts got rotated through every few minutes, burning each one's remaining quota in turn. `cswap config set autoswitch.holdWhenAllOverThreshold false` (or `cswap auto --no-hold-when-all-over-threshold`) restores the old behavior: move to whichever account recovers first. With the hold on, the at-limit escape only lands on an account that is under its thresholds.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
 - **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted. `priority` is a primary/backup pattern: it always runs the **earliest account in rotation order** that's below the threshold, reclaiming a higher-priority account the instant it's healthy again — even while the active one is still fine. Rotation order is the same order `cswap list` shows; reorder it with `cswap move <account> <slot>` or `cswap swap <a> <b>` (see below).
-- **Per-account threshold** (`cswap threshold <account> <pct>`): give one account its own switch-away limit instead of the fleet default — e.g. `cswap threshold 3 95` lets account 3 run hotter, or a lower value protects an account by treating it as "full" earlier. It wins over everything else, including a one-off `cswap auto --threshold`; remove it with `cswap threshold 3 --unset`, or list every override with a bare `cswap threshold`.
+- **Per-account threshold** (`cswap threshold <account> <pct>`): give one account its own switch-away limit instead of the fleet default — e.g. `cswap threshold 3 95` lets account 3 run hotter, or a lower value protects an account by treating it as "full" earlier. It applies to both the session and the weekly windows; add `--session` or `--weekly` to override only one (`cswap threshold 3 80 --session`). It wins over everything else, including a one-off `cswap auto --threshold`; remove it with `cswap threshold 3 --unset` (or `--unset --weekly` for just that one), or list every override with a bare `cswap threshold`.
+- Each switch is logged with its reason and figures, e.g. `Switched from account 3 to 6 (auto at-limit; from #3 5h 100% · 7d 62% -> to #6 5h 12% · 7d 40%)`, so a log read later says *why* every move happened.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
 - An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
@@ -129,7 +133,11 @@ cswap wrap --model Fable          # also watch per-model weekly limits
 cswap wrap --no-auto-continue     # switch accounts, but don't type 'continue'
 ```
 
-When **every** account is exhausted, wrap computes the earliest moment any account gets quota back — per account the latest reset among its exhausted windows (5h, 7d, and configured per-model windows), then the soonest across accounts — prints a countdown, sleeps, and switches + resumes when the first account recovers. It re-checks on a bounded cadence, so quota granted early (or an account you re-enable meanwhile) is picked up.
+With `autoswitch.holdWhenAllOverThreshold` on (the default), wrap follows the same rule as `cswap auto`: if every other account is over its threshold too, it does not rotate onto one of them; it holds on the current account, notifies you when the first account will be back under its thresholds, and switches (or resumes on the same account, if that is the one that reset) once one is. With the hold on, wrap only ever switches to an account that is under its thresholds (picked among those by `--strategy`), never one merely "less spent". `--no-hold-when-all-over-threshold` restores rotating. Every wrap switch is recorded in the auto-switch state file, so a `cswap auto` running alongside counts it toward its cooldown.
+
+When **every** account is exhausted, wrap computes the earliest moment any account gets quota back — per account the latest reset among its exhausted windows (5h, 7d, and configured per-model windows), then the soonest across accounts — sleeps, and switches + resumes when the first account recovers. It re-checks on a bounded cadence, so quota granted early (or an account you re-enable meanwhile) is picked up.
+
+Wrap never writes to the terminal — it belongs to claude's TUI, and any foreign line breaks its redraw. Status lines go to `claude-swap.log`, and the events worth interrupting for (a switch, the start of a wait, giving up on an account that already has quota) are posted as macOS notifications labelled with the working directory.
 
 Wrap never interprets claude's arguments: everything after `--` is passed through verbatim, and claude's exit code becomes the wrapper's — so it drops into aliases and scripts:
 
@@ -219,6 +227,7 @@ cswap alias 2 dev               # Give an account a short alias (usable anywhere
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
 cswap threshold 3 95            # Give account 3 its own autoswitch.threshold override
+cswap threshold 3 80 --session  # ...or only for its 5h window (--weekly: 7d + per-model)
 cswap threshold 3 --unset       # Remove an account's threshold override
 cswap threshold                 # List all threshold overrides
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
@@ -301,6 +310,9 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set autoswitch.sessionThreshold 85   # 5h window only (default: autoswitch.threshold)
+cswap config set autoswitch.weeklyThreshold 95    # 7d + per-model windows (default: autoswitch.threshold)
+cswap config set autoswitch.holdWhenAllOverThreshold false   # rotate even when every account is over
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

@@ -168,6 +168,36 @@ def limiting_reset_ts(
     return latest
 
 
+def under_threshold_at(
+    usage: dict | None,
+    models: tuple[str, ...],
+    session_threshold: float,
+    weekly_threshold: float,
+    now: float,
+) -> float | None:
+    """Epoch when this account drops back under its switch thresholds.
+
+    ``now`` when it already is. Otherwise the LATEST reset among the windows
+    at/over their own threshold (5h against the session threshold, 7d and
+    per-model windows against the weekly one) — every one of them has to roll
+    over. None when that cannot be proven: usage unknown, or an over-threshold
+    window with no future ``resets_at`` (stale or missing).
+    """
+    windows = oauth.relevant_windows(usage, models)
+    if not windows:
+        return None
+    latest: float | None = None
+    for label, pct, resets_at in windows:
+        if pct < oauth.window_threshold(label, session_threshold, weekly_threshold):
+            continue
+        ts = parse_reset_ts(resets_at)
+        if ts is None or ts <= now:
+            return None
+        if latest is None or ts > latest:
+            latest = ts
+    return now if latest is None else latest
+
+
 def earliest_future_reset_ts(
     usage: dict | None, now: float, models: tuple[str, ...] = ()
 ) -> float | None:
@@ -203,6 +233,7 @@ def plan_after_fetch(
     recent_429: bool,
     now: float,
     rng: Callable[[], float] = random.random,
+    weekly_threshold: float | None = None,
 ) -> tuple[float, float]:
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
 
@@ -235,12 +266,21 @@ def plan_after_fetch(
         # through 90s/135s polls that the budget never intended.
         moving = False
         interval = min(ceiling, max(MIN_INTERVAL_S, base * 1.5))
+    # ``threshold`` is the session (5h) threshold; ``weekly_threshold``
+    # (default: the same) gates 7d and the per-model weekly windows. Urgent
+    # mode keys on whichever window is closest to ITS OWN threshold.
+    gap = oauth.threshold_gap(
+        new_usage,
+        models,
+        threshold,
+        threshold if weekly_threshold is None else weekly_threshold,
+    )
     if (
         is_active
         and moving
         and not recent_429
-        and new_pct is not None
-        and new_pct >= threshold - ESCALATION_MARGIN_PCT
+        and gap is not None
+        and gap >= -ESCALATION_MARGIN_PCT
     ):
         interval = URGENT_INTERVAL_S
     if recent_429:

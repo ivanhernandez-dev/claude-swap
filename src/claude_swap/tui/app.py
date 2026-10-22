@@ -72,12 +72,17 @@ class CswapApp(App):
         self._last_refresh_error = ""
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
+        # Two ticks when autoswitch.sessionThreshold / weeklyThreshold
+        # differ: the 5h bar at the session one, the weekly bars at the other.
         try:
-            self.threshold_pct: float | None = load_settings(
-                switcher.backup_dir
-            ).threshold
+            loaded = load_settings(switcher.backup_dir)
+            self.threshold_pct: float | None = loaded.effective_session_threshold
+            self.weekly_threshold_pct: float | None = (
+                loaded.effective_weekly_threshold
+            )
         except Exception:
             self.threshold_pct = None
+            self.weekly_threshold_pct = None
         try:
             self._theme_name = load_ui_settings(switcher.backup_dir).theme
         except Exception:

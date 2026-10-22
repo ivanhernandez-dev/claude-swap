@@ -593,15 +593,23 @@ def _threshold_command(argv: list[str]) -> None:
             "Set, remove, or list a per-account override of "
             "autoswitch.threshold. Overrides the fleet default for that one "
             "account — including a one-off `cswap auto --threshold` — until "
-            "unset."
+            "unset. Without --session/--weekly it applies to both the 5h "
+            "(session) window and the weekly windows (7d and per-model)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Examples:
-  cswap threshold 2 95
+  cswap threshold 2 95                # 5h and weekly windows
   cswap threshold user@example.com 95
-  cswap threshold 2 --unset
+  cswap threshold 2 80 --session      # only the 5h window
+  cswap threshold 2 97 --weekly       # only 7d + per-model windows
+  cswap threshold 2 --unset           # remove every override of account 2
+  cswap threshold 2 --unset --weekly  # remove only the weekly one
   cswap threshold                     # list all overrides
+
+Precedence for one account's window: its --session/--weekly override, then
+its shared override, then autoswitch.sessionThreshold / weeklyThreshold, then
+autoswitch.threshold.
 
 Range: {spec.lo}-{spec.hi} (same bounds as autoswitch.threshold).
         """,
@@ -619,8 +627,24 @@ Range: {spec.lo}-{spec.hi} (same bounds as autoswitch.threshold).
         help=f"Threshold to set, {spec.lo}-{spec.hi}.",
     )
     parser.add_argument("--unset", action="store_true", help="Remove the account's override")
+    window = parser.add_mutually_exclusive_group()
+    window.add_argument(
+        "--session",
+        dest="which",
+        action="store_const",
+        const="session",
+        help="Only the 5h (session) window",
+    )
+    window.add_argument(
+        "--weekly",
+        dest="which",
+        action="store_const",
+        const="weekly",
+        help="Only the weekly windows (7d and per-model)",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
+    which = args.which or "both"
 
     if args.unset and args.value:
         parser.error("--unset does not take a PCT argument")
@@ -634,26 +658,39 @@ Range: {spec.lo}-{spec.hi} (same bounds as autoswitch.threshold).
         _guard_root(switcher)
 
         if args.account is None:
-            rows = switcher.list_account_thresholds()
+            rows = switcher.list_account_threshold_overrides()
             if not rows:
                 print(dimmed("No per-account threshold overrides set"))
                 return
             print(bolded("Threshold overrides:"))
-            for num, value, email in rows:
-                print(f"  {num}: {value:g}% {muted(f'({email})')}")
+            for num, shared, session, weekly, email in rows:
+                parts = []
+                if shared is not None:
+                    parts.append(f"{shared:g}%")
+                if session is not None:
+                    parts.append(f"5h {session:g}%")
+                if weekly is not None:
+                    parts.append(f"weekly {weekly:g}%")
+                print(f"  {num}: {', '.join(parts)} {muted(f'({email})')}")
             return
 
+        scope = {"both": "", "session": " (5h)", "weekly": " (weekly)"}[which]
         if args.unset:
-            account_num = switcher.unset_account_threshold(args.account)
-            print(f"{accent('Removed threshold override')} for Account {account_num}")
+            account_num = switcher.unset_account_threshold(args.account, which)
+            print(
+                f"{accent('Removed threshold override')}{scope} for "
+                f"Account {account_num}"
+            )
         else:
             try:
                 value = float(args.value)
             except ValueError:
                 parser.error(f"PCT must be a number, got: {args.value!r}")
-            account_num, value = switcher.set_account_threshold(args.account, value)
+            account_num, value = switcher.set_account_threshold(
+                args.account, value, which
+            )
             print(
-                f"{accent('Set threshold override')} {value:g}% for "
+                f"{accent('Set threshold override')}{scope} {value:g}% for "
                 f"Account {account_num}"
             )
     except ClaudeSwitchError as e:
@@ -695,6 +732,7 @@ Exit codes with --once:
 Examples:
   cswap auto                       # foreground loop, switch at 90%% used
   cswap auto --threshold 80        # switch earlier
+  cswap auto --session-threshold 85 --weekly-threshold 95
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
@@ -726,6 +764,35 @@ Defaults live in settings.json in the backup root; flags override them.
         help=(
             "Switch when the active account's binding 5h/7d window reaches "
             "this utilization (0.01-99.99; default 90)"
+        ),
+    )
+    parser.add_argument(
+        "--session-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Threshold for the 5h (session) window only "
+            "(default: autoswitch.sessionThreshold, else --threshold)"
+        ),
+    )
+    parser.add_argument(
+        "--weekly-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Threshold for the 7d and per-model weekly windows only "
+            "(default: autoswitch.weeklyThreshold, else --threshold)"
+        ),
+    )
+    parser.add_argument(
+        "--hold-when-all-over-threshold",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When every account is over its threshold, stay on the active "
+            "one until some account drops back under (default: on; "
+            "--no-hold-when-all-over-threshold restores rotating to the "
+            "soonest-recovering account)"
         ),
     )
     parser.add_argument(
@@ -787,9 +854,9 @@ Defaults live in settings.json in the backup root; flags override them.
     def human_emit(event: AutoSwitchEvent) -> None:
         stamp = _time.strftime("%H:%M:%S")
         line = event.human()
-        if event.kind == "switch":
+        if event.kind in ("switch", "hold-end"):
             line = accent(line)
-        elif event.kind in ("error", "account-quarantined"):
+        elif event.kind in ("error", "account-quarantined", "hold"):
             line = yellowed(line)
         elif event.kind in ("poll", "no-switch", "sleep"):
             line = dimmed(line)
@@ -816,9 +883,16 @@ Defaults live in settings.json in the backup root; flags override them.
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         if not args.json:
+            session = settings.effective_session_threshold
+            weekly = settings.effective_weekly_threshold
+            shown = (
+                f"{session:g}%"
+                if session == weekly
+                else f"5h {session:g}% / weekly {weekly:g}%"
+            )
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
+                    f"Auto-switch running: threshold {shown}, "
                     f"every {settings.interval_seconds:.0f}s"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
@@ -900,6 +974,16 @@ the reactive net for turns that hit the limit mid-flight.
         ),
     )
     parser.add_argument(
+        "--hold-when-all-over-threshold",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "On a limit hit, when every other account is over its threshold "
+            "too, wait for one to drop back under instead of rotating onto "
+            "it (default: autoswitch.holdWhenAllOverThreshold, on)"
+        ),
+    )
+    parser.add_argument(
         "--auto-continue",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -919,18 +1003,31 @@ the reactive net for turns that hit the limit mid-flight.
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
 
-        from claude_swap.settings import load_settings, parse_model_names
+        from claude_swap.settings import (
+            account_thresholds,
+            load_settings,
+            parse_model_names,
+        )
         from claude_swap.wrap import WrapSession
 
+        settings = load_settings(switcher.backup_dir)
         model_value = args.model
         if model_value is None:
-            model_value = load_settings(switcher.backup_dir).model
+            model_value = settings.model
+        hold = settings.hold_when_all_over_threshold
+        if args.hold_when_all_over_threshold is not None:
+            hold = args.hold_when_all_over_threshold
         session = WrapSession(
             switcher,
             tail,
             strategy=args.strategy,
             models=parse_model_names(model_value),
             auto_continue=args.auto_continue,
+            # Same "over threshold" rule and hold as `cswap auto`.
+            thresholds_for=lambda num: account_thresholds(
+                settings, switcher.account_threshold_overrides(num)
+            ),
+            hold_when_all_over=hold,
         )
         sys.exit(session.run())
     except ClaudeSwitchError as e:
@@ -960,8 +1057,15 @@ def _config_command(argv: list[str]) -> None:
         unset_setting,
     )
 
+    key_w = max(len(spec.dotted) for spec in SETTING_SPECS.values()) + 2
     key_lines = "\n".join(
-        f"  {spec.dotted:<34}{spec.help} (default {format_setting_value(spec.default)})"
+        f"  {spec.dotted:<{key_w}}{spec.help} ("
+        + (
+            f"default: same as {spec.inherits}"
+            if spec.inherits
+            else f"default {format_setting_value(spec.default)}"
+        )
+        + ")"
         for spec in SETTING_SPECS.values()
     )
     parser = argparse.ArgumentParser(
@@ -980,7 +1084,17 @@ Examples:
   cswap config get autoswitch.threshold
   cswap config set autoswitch.threshold 80
   cswap config unset autoswitch.threshold   # back to the default
+  cswap config set autoswitch.sessionThreshold 85   # 5h window only
+  cswap config set autoswitch.weeklyThreshold 95    # 7d + per-model windows
+  cswap config set autoswitch.holdWhenAllOverThreshold false
   cswap config path                         # where settings.json lives
+
+An account is over its threshold when its 5h window reaches
+sessionThreshold OR any weekly window (7d, autoswitch.model ones) reaches
+weeklyThreshold; both default to autoswitch.threshold. With
+holdWhenAllOverThreshold on (default), when the active account and every
+candidate are over, cswap auto and cswap wrap stay on the active account
+until one drops back under (e.g. its 5h window resets).
         """,
     )
     parser.add_argument(
@@ -1256,6 +1370,7 @@ Commands:
   %(prog)s alias <num|email> --unset  remove an account's alias
   %(prog)s alias                      list all aliases
   %(prog)s threshold <num|email> <pct> set an account's own switch-away threshold
+  %(prog)s threshold <num> <pct> --session|--weekly  only the 5h / weekly windows
   %(prog)s threshold <num|email> --unset remove an account's threshold override
   %(prog)s threshold                  list all threshold overrides
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers

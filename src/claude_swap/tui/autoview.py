@@ -85,7 +85,9 @@ class AutoScreen(Screen):
         # adjust mode was entered (wake/log only on a net change).
         self._adjusting = False
         self._configured_threshold: float | None = None
-        self._entry_threshold: float | None = None
+        self._configured_session: float | None = None
+        self._configured_weekly: float | None = None
+        self._entry_threshold: tuple[float, float] | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -107,7 +109,10 @@ class AutoScreen(Screen):
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
-        self.app.threshold_pct = self._settings.threshold
+        self._configured_session = self._settings.effective_session_threshold
+        self._configured_weekly = self._settings.effective_weekly_threshold
+        self.app.threshold_pct = self._configured_session
+        self.app.weekly_threshold_pct = self._configured_weekly
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
@@ -120,7 +125,8 @@ class AutoScreen(Screen):
         # the poll planner and put the bar tick back on the file value.
         self.app.switcher.clear_poll_policy_inputs()
         if self._configured_threshold is not None:
-            self.app.threshold_pct = self._configured_threshold
+            self.app.threshold_pct = self._configured_session
+            self.app.weekly_threshold_pct = self._configured_weekly
         self.app.set_store_only(False)
 
     def _on_theme_change(self, _theme: str) -> None:
@@ -148,7 +154,7 @@ class AutoScreen(Screen):
             self._end_adjust()
             return
         self._adjusting = True
-        self._entry_threshold = self._settings.threshold
+        self._entry_threshold = self._effective_thresholds()
         self._update_summary()
         self.refresh_bindings()
 
@@ -167,7 +173,7 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._update_summary()
         self.refresh_bindings()
-        if self._settings.threshold == self._entry_threshold:
+        if self._effective_thresholds() == self._entry_threshold:
             return  # no net change: nothing to announce, no tick to force
         if self._engine is not None:
             self._engine.wake()  # show a decision at the new value now
@@ -179,13 +185,27 @@ class AutoScreen(Screen):
             )
         )
 
+    def _effective_thresholds(self) -> tuple[float, float]:
+        return (
+            self._settings.effective_session_threshold,
+            self._settings.effective_weekly_threshold,
+        )
+
     def _set_threshold(self, value: float) -> None:
-        if value == self._settings.threshold:
+        if self._effective_thresholds() == (value, value):
             return
-        self._settings = replace(self._settings, threshold=value)
+        # One session knob for every window: the split values (if any) are
+        # set aside for the session, exactly as apply_threshold() does.
+        self._settings = replace(
+            self._settings,
+            threshold=value,
+            session_threshold=None,
+            weekly_threshold=None,
+        )
         if self._engine is not None:
             self._engine.apply_threshold(value)
         self.app.threshold_pct = value
+        self.app.weekly_threshold_pct = value
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
 
@@ -193,8 +213,12 @@ class AutoScreen(Screen):
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
         text.append("auto-switch · ")
+        session = self._settings.effective_session_threshold
+        weekly = self._settings.effective_weekly_threshold
         text.append(
-            f"threshold {pct_label(self._settings.threshold)}%",
+            f"threshold {pct_label(session)}%"
+            if session == weekly
+            else f"threshold 5h {pct_label(session)}% / weekly {pct_label(weekly)}%",
             style=palette.accent if self._adjusting else "",
         )
         if self._settings.threshold != self._configured_threshold:

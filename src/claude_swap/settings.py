@@ -57,6 +57,37 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Split thresholds. ``session_threshold`` gates the 5-hour window and
+    # ``weekly_threshold`` the 7-day window plus every configured per-model
+    # weekly window (``model``). None = inherit ``threshold``, so a settings
+    # file that never mentions them behaves exactly as before. An account is
+    # "over its threshold" when 5h >= session OR any weekly window >= weekly.
+    session_threshold: float | None = None
+    weekly_threshold: float | None = None
+    # When the active account AND every measured candidate are over their
+    # thresholds, stay on the active account (no proactive move, no at-limit
+    # escape) until some account drops back under its thresholds, instead of
+    # rotating through accounts that are all nearly spent. False restores the
+    # old "move to whichever recovers first" behavior.
+    hold_when_all_over_threshold: bool = True
+
+    @property
+    def effective_session_threshold(self) -> float:
+        """The 5h threshold actually in force (``threshold`` when unset)."""
+        return (
+            self.session_threshold
+            if self.session_threshold is not None
+            else self.threshold
+        )
+
+    @property
+    def effective_weekly_threshold(self) -> float:
+        """The weekly (7d + per-model) threshold actually in force."""
+        return (
+            self.weekly_threshold
+            if self.weekly_threshold is not None
+            else self.threshold
+        )
 
 
 @dataclass(frozen=True)
@@ -87,6 +118,9 @@ class SettingSpec:
     hi: float | None = None
     choices: tuple[str, ...] = ()
     help: str = ""
+    # Dotted key this one falls back to when unset (its default is None):
+    # ``cswap config`` shows the inherited value as the effective one.
+    inherits: str = ""
 
     @property
     def dotted(self) -> str:
@@ -104,7 +138,22 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     for spec in (
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 0.01, 99.99,
-            help="Switch when the binding 5h/7d window reaches this pct",
+            help="Switch when any 5h/7d window reaches this pct (base for the split keys)",
+        ),
+        SettingSpec(
+            "autoswitch", "sessionThreshold", "session_threshold", "float", 0.01, 99.99,
+            help="Threshold for the 5h (session) window",
+            inherits="autoswitch.threshold",
+        ),
+        SettingSpec(
+            "autoswitch", "weeklyThreshold", "weekly_threshold", "float", 0.01, 99.99,
+            help="Threshold for the 7d and per-model weekly windows",
+            inherits="autoswitch.threshold",
+        ),
+        SettingSpec(
+            "autoswitch", "holdWhenAllOverThreshold", "hold_when_all_over_threshold",
+            "bool",
+            help="Stay on the active account while every account is over its threshold",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
@@ -167,6 +216,21 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
     return tuple(seen.values())
 
 
+def account_thresholds(
+    settings: AutoSwitchSettings,
+    overrides: tuple[float | None, float | None] = (None, None),
+) -> tuple[float, float]:
+    """One account's ``(session, weekly)`` thresholds: its own per-account
+    overrides (``ClaudeAccountSwitcher.account_threshold_overrides``) where
+    set, else the fleet's effective split values. Shared by ``cswap auto``
+    and ``cswap wrap`` so both judge "over threshold" identically."""
+    session_ov, weekly_ov = overrides
+    return (
+        session_ov if session_ov is not None else settings.effective_session_threshold,
+        weekly_ov if weekly_ov is not None else settings.effective_weekly_threshold,
+    )
+
+
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
     """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
 
@@ -182,6 +246,9 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
         value = getattr(settings, spec.field)
         if spec.kind in ("float", "int"):
             clamped = num(value, spec.default, spec.lo, spec.hi)
+            if clamped is None:  # optional (inheriting) key left unset
+                kwargs[spec.field] = None
+                continue
             kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
         elif spec.kind == "bool":
             kwargs[spec.field] = bool(value)
@@ -417,20 +484,33 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     for spec in SETTING_SPECS.values():
         section = raw.get(spec.section)
         is_set = isinstance(section, dict) and spec.json_key in section
-        rows.append((spec, getattr(loaded[spec.section], spec.field), is_set))
+        value = getattr(loaded[spec.section], spec.field)
+        if value is None and spec.inherits:
+            parent = SETTING_SPECS[spec.inherits]
+            value = getattr(loaded[parent.section], parent.field)
+        rows.append((spec, value, is_set))
     return rows
 
 
 def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     """Overlay non-None CLI overrides (argparse Namespace) onto settings."""
     overrides = {}
+    if getattr(args, "threshold", None) is not None:
+        # A one-off --threshold means "switch at this pct" on every window:
+        # it replaces the configured split values too, unless the split
+        # flags below pin one of them explicitly.
+        overrides["session_threshold"] = None
+        overrides["weekly_threshold"] = None
     for attr, field in (
         ("threshold", "threshold"),
+        ("session_threshold", "session_threshold"),
+        ("weekly_threshold", "weekly_threshold"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("hold_when_all_over_threshold", "hold_when_all_over_threshold"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
