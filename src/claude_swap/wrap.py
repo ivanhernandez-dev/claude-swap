@@ -20,7 +20,7 @@ messages. On a hit it:
    accounts — per account the latest reset among its exhausted windows
    (5h, 7d, and configured per-model scoped windows), then the minimum
    across accounts, mirroring ``AutoSwitchEngine._earliest_recovery`` —
-   shows a countdown, sleeps, and switches + continues when quota returns.
+   sleeps, and switches + continues when quota returns.
 4. With ``autoswitch.holdWhenAllOverThreshold`` (the CLI wires it from
    settings), when every OTHER account is over its switch threshold too
    (5h >= sessionThreshold or any weekly window >= weeklyThreshold), it does
@@ -28,6 +28,11 @@ messages. On a hit it:
    It waits instead until some account drops back under its thresholds
    (typically a 5h reset), then resumes there: the same rule ``cswap auto``
    follows.
+
+The terminal belongs to claude's TUI, so the wrapper never writes to it:
+status lines go to the claude-swap log, and the few events worth
+interrupting for (a switch, the start of a wait, giving up) are posted as
+desktop notifications.
 
 The wrapper never parses or rewrites claude's arguments: everything after
 ``cswap wrap`` (optionally separated by ``--``) is passed through verbatim,
@@ -37,10 +42,13 @@ and claude's exit code becomes the wrapper's.
 from __future__ import annotations
 
 import fcntl
+import functools
+import logging
 import os
 import re
 import select
 import signal
+import subprocess
 import sys
 import termios
 import threading
@@ -51,7 +59,6 @@ from collections.abc import Callable, Sequence
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import record_external_switch, window_figures
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.printer import accent, dimmed, yellowed
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 # ---------------------------------------------------------------------------
@@ -98,6 +105,14 @@ NO_RESET_FALLBACK_S = 300.0
 # providers can grant quota early, and the user may have re-enabled or
 # re-added an account while we waited.
 MAX_SLEEP_S = poll_policy.EXHAUSTED_INTERVAL_S
+
+# A reading younger than the serve TTL is served from the store without a
+# fetch, so right after a real limit the active account can still show
+# headroom. Before giving up on such an account, wait this long so the
+# reading can be refetched.
+RECHECK_DELAY_S = poll_policy.SERVE_TTL_S + 5.0
+
+NOTIFY_TIMEOUT_S = 10.0
 
 
 def strip_ansi(data: bytes) -> str:
@@ -156,11 +171,55 @@ def _fmt_countdown(seconds: float) -> str:
     return f"{secs}s"
 
 
+def _log_status(line: str) -> None:
+    logging.getLogger("claude-swap").info("wrap: %s", line)
+
+
+def notify_macos(message: str, *, subtitle: str) -> None:
+    """Post a macOS notification.
+
+    The text travels as script arguments, never as script source, so
+    nothing in it — an account email, a line of terminal output — can run.
+    """
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                "on run argv",
+                "-e",
+                (
+                    "display notification (item 1 of argv) "
+                    'with title "claude-swap" subtitle (item 2 of argv)'
+                ),
+                "-e",
+                "end run",
+                message,
+                subtitle,
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=NOTIFY_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _default_notifier() -> Callable[[str], None]:
+    """macOS notifications, labelled with the working directory so several
+    wrapped sessions can be told apart; a no-op elsewhere."""
+    if sys.platform != "darwin":
+        return lambda message: None
+    return functools.partial(notify_macos, subtitle=os.path.basename(os.getcwd()))
+
+
 class WrapSession:
     """Run claude under a PTY and recover from mid-turn rate limits.
 
-    ``clock``/``out`` are injectable for tests; in production they read wall
-    time and write status lines to stdout.
+    ``clock``/``out``/``notify`` are injectable for tests; in production they
+    read wall time, append status lines to the claude-swap log, and post
+    desktop notifications.
     """
 
     def __init__(
@@ -174,6 +233,7 @@ class WrapSession:
         claude_bin: str = "claude",
         clock: Callable[[], float] = time.time,
         out: Callable[[str], None] | None = None,
+        notify: Callable[[str], None] | None = None,
         thresholds_for: Callable[[str], tuple[float, float]] | None = None,
         hold_when_all_over: bool = False,
     ):
@@ -189,11 +249,8 @@ class WrapSession:
         self.auto_continue = auto_continue
         self.claude_bin = claude_bin
         self.clock = clock
-        # Wrapper status lines go to stdout, interleaved with claude's own
-        # output; the terminal is in raw mode, so newlines need \r\n.
-        self._out = out or (
-            lambda line: print(line.replace("\n", "\r\n"), flush=True)
-        )
+        self._out = out or _log_status
+        self._notify = notify or _default_notifier()
         self._master_fd: int | None = None
         self._scan_tail = ""
         self._last_trigger = 0.0
@@ -202,9 +259,16 @@ class WrapSession:
 
     # -- user-facing status -------------------------------------------------
 
-    def _status(self, msg: str) -> None:
-        stamp = time.strftime("%H:%M:%S")
-        self._out(f"{dimmed(f'[cswap {stamp}] {msg}')}")
+    def _status(self, msg: str, *, notify: bool = False) -> None:
+        """Record a status line; ``notify`` also surfaces it to the user.
+
+        Nothing is ever written to the terminal: it belongs to claude's TUI,
+        which redraws relative to the cursor and is left with ghost frames by
+        any line it did not print itself.
+        """
+        self._out(msg)
+        if notify:
+            self._notify(msg)
 
     # -- detection ----------------------------------------------------------
 
@@ -221,34 +285,31 @@ class WrapSession:
         if self._recovery_lock.locked():
             return  # a recovery is already switching/waiting
         self._last_trigger = now
+        self._scan_tail = ""
         threading.Thread(target=self._recover, args=(message,), daemon=True).start()
 
     # -- recovery -----------------------------------------------------------
 
     def _recover(self, message: str) -> None:
         with self._recovery_lock:
-            self._status(
-                yellowed(f'"{message}" — looking for an account with quota…')
-            )
+            self._status(f'"{message}" — looking for an account with quota…')
             waited = False
             holding = False
+            rechecked = False
             while not self._stop.is_set():
+                snapshot = None
                 if self.hold_when_all_over:
                     snapshot = self._usage_snapshot()
                     verdict = self._hold_verdict(snapshot)
                     if verdict is not None:
                         active, active_headroom, release_ts = verdict
                         if active_headroom > 0:
-                            # Usage says the active account still has quota
-                            # (an unwatched per-model limit, or limit text
-                            # quoted in the conversation): nothing to wait
-                            # for, and nowhere under threshold to go.
-                            self._status(
-                                f"Account-{active} still has quota and every "
-                                "other account is over its threshold — not "
-                                "switching; type 'continue' if the turn stopped"
-                            )
-                            return
+                            if self._settle_active_with_quota(
+                                active, waited, rechecked
+                            ):
+                                return
+                            rechecked = True
+                            continue
                         if not holding:
                             when = (
                                 time.strftime(
@@ -258,10 +319,9 @@ class WrapSession:
                                 else "a window resets (time unknown)"
                             )
                             self._status(
-                                yellowed(
-                                    "all accounts are over their threshold: "
-                                    f"holding on Account-{active} until {when}"
-                                )
+                                "all accounts are over their threshold: "
+                                f"holding on Account-{active} until {when}",
+                                notify=True,
                             )
                             holding = True
                         now = self.clock()
@@ -274,54 +334,80 @@ class WrapSession:
                         waited = True
                         continue
                     if holding and snapshot is None:
-                        # Usage unreadable this round: that is no evidence
-                        # the hold is over — keep waiting, don't rotate.
                         self._sleep(NO_RESET_FALLBACK_S)
                         continue
                     if holding:
                         holding = False
-                        self._status(accent("hold over: an account is back under its threshold"))
+                        self._status(
+                            "hold over: an account is back under its threshold"
+                        )
                     if waited:
-                        # After a wait, the account in use coming back under
-                        # its thresholds is the cheapest place to resume.
                         back = self._active_under_threshold(snapshot)
                         if back is not None:
-                            self._status(accent(f"quota is back on Account-{back}"))
-                            self._resume()
+                            self._resume(f"quota is back on Account-{back}")
                             return
-                if self._try_switch_and_continue():
+                if self._try_switch_and_continue(snapshot):
                     return
-                snapshot = self._usage_snapshot()
+                if snapshot is None:
+                    snapshot = self._usage_snapshot()
                 active = self._active_with_quota(snapshot)
                 if active is not None:
-                    if waited:
-                        self._status(accent(f"quota is back on Account-{active}"))
-                        self._resume()
-                    else:
-                        self._status(
-                            f"Account-{active} has quota — not waiting; "
-                            "type 'continue' if the turn stopped"
-                        )
-                    return
+                    if self._settle_active_with_quota(active, waited, rechecked):
+                        return
+                    rechecked = True
+                    continue
                 wait_s = self._compute_wait_s(snapshot)
                 if wait_s is None:
                     wait_s = NO_RESET_FALLBACK_S
                     self._status(
                         "all accounts exhausted and no reset time is known; "
-                        f"re-checking every {_fmt_countdown(wait_s)}"
+                        f"re-checking every {_fmt_countdown(wait_s)}",
+                        notify=not waited,
                     )
                 elif self.hold_when_all_over:
                     self._status(
                         "no account under its threshold; the first is back in "
-                        f"{_fmt_countdown(wait_s)} — waiting"
+                        f"{_fmt_countdown(wait_s)} — waiting",
+                        notify=not waited,
                     )
                 else:
                     self._status(
                         "all accounts exhausted; first quota returns in "
-                        f"{_fmt_countdown(wait_s)} — waiting"
+                        f"{_fmt_countdown(wait_s)} — waiting",
+                        notify=not waited,
                     )
                 self._sleep(wait_s)
                 waited = True
+
+    def _settle_active_with_quota(
+        self, active: str, waited: bool, rechecked: bool
+    ) -> bool:
+        """Handle a limit hit while usage still shows quota on the active
+        account; True when the recovery is over.
+
+        After a wait that quota is the recovery: resume. Otherwise the
+        reading may predate the limit (it is served from the store for up to
+        the serve TTL), so refetch it once before giving up — a limit that
+        still shows quota after that is one the usage data does not carry,
+        or limit text quoted in the conversation.
+        """
+        if waited:
+            self._resume(f"quota is back on Account-{active}")
+            return True
+        if rechecked:
+            self._status(
+                f"Account-{active} has quota — not switching; "
+                "type 'continue' if the turn stopped",
+                notify=True,
+            )
+            return True
+        self._status(
+            f"Account-{active} shows quota; re-checking in "
+            f"{_fmt_countdown(RECHECK_DELAY_S)} in case that reading is stale"
+        )
+        self._sleep(RECHECK_DELAY_S)
+        self._refresh_usage(active)
+        return False
 
     def _sleep(self, seconds: float) -> None:
         """Sleep up to ``seconds``, capped so quota granted early (or a
@@ -337,7 +423,7 @@ class WrapSession:
             accounts_info = self.switcher._build_accounts_info()
             entries = self.switcher._collect_usage_entries(accounts_info)
         except Exception as e:  # never die waiting
-            self._status(yellowed(f"couldn't read usage data ({e!r}); will retry"))
+            self._status(f"couldn't read usage data ({e!r}); will retry")
             return None
         active = next((str(info[0]) for info in accounts_info if info[4]), None)
         usage = {num: entry.decision_value() for num, entry in entries.items()}
@@ -398,15 +484,9 @@ class WrapSession:
             for n in measured
         ):
             return None
-        now = self.clock()
-        release: float | None = None
-        for num in [active, *measured]:
-            session, weekly = self.thresholds_for(num)
-            ts = poll_policy.under_threshold_at(
-                usage[num], self.models, session, weekly, now
-            )
-            if ts is not None and (release is None or ts < release):
-                release = ts
+        release = self._threshold_release_ts(
+            {n: usage[n] for n in [active, *measured]}, self.clock()
+        )
         return active, active_headroom, release
 
     def _over(self, num: str, value: dict | str | None) -> bool | None:
@@ -429,6 +509,15 @@ class WrapSession:
         if active is None:
             return None
         return active if self._over(active, usage.get(active)) is False else None
+
+    def _refresh_usage(self, account: str) -> None:
+        """Refetch one account's usage ahead of its poll plan, so the next
+        switch attempt decides on a current reading."""
+        try:
+            accounts_info = self.switcher._build_accounts_info()
+            self.switcher._collect_usage_entries(accounts_info, fetch={account})
+        except Exception as e:
+            self._status(f"couldn't refresh usage data ({e!r})")
 
     def _compute_wait_s(
         self, snapshot: tuple[dict[str, dict | str | None], str | None] | None
@@ -476,41 +565,51 @@ class WrapSession:
     def _under_threshold_target(
         self, snapshot: tuple[dict[str, dict | str | None], str | None] | None
     ) -> str | None:
-        """With the hold on: the switchable account (not the active one)
-        that is UNDER its thresholds and has the most headroom, or None.
+        """With the hold on: a switchable account (not the active one) that
+        is UNDER its thresholds and has headroom, or None.
 
-        ``switch(strategy="best")`` ranks on headroom alone, which with
+        ``switch(strategy=...)`` ranks on headroom alone, which with
         different session/weekly thresholds can pick an account still over
-        one of them — the move the hold exists to prevent. Ties go to
-        rotation order.
+        one of them — the move the hold exists to prevent. Among the
+        eligible accounts the strategy still decides: ``next-available``
+        takes the first one after the active account in rotation order,
+        ``best`` the one with the most headroom (ties to rotation order).
         """
         if snapshot is None:
             return None
         usage, active = snapshot
+        order = list(self.switcher.switchable_account_numbers())
+        if active in order:
+            at = order.index(active)
+            order = order[at + 1 :] + order[:at]
         best: tuple[float, str] | None = None
-        for num in self.switcher.switchable_account_numbers():
+        for num in order:
             if num == active or self._over(num, usage.get(num)) is not False:
                 continue
             headroom = oauth.account_headroom(usage.get(num), self.models)
             if headroom is None or headroom <= 0:
                 continue
+            if self.strategy == "next-available":
+                return num
             if best is None or headroom > best[0]:
                 best = (headroom, num)
         return best[1] if best else None
 
-    def _try_switch_and_continue(self) -> bool:
+    def _try_switch_and_continue(
+        self,
+        snapshot: tuple[dict[str, dict | str | None], str | None] | None = None,
+    ) -> bool:
         """Switch to the best account with headroom; resume the turn.
 
         Returns True when the active account changed and ``continue`` was
         (or, with --no-auto-continue, was not) queued at the prompt. With the
         hold on, only an account under its thresholds qualifies (see
-        ``_under_threshold_target``); the switch is recorded in
-        ``autoswitch_state.json`` so ``cswap auto`` shares its cooldown.
+        ``_under_threshold_target``), chosen from ``snapshot``; the switch is
+        recorded in ``autoswitch_state.json`` so ``cswap auto`` shares its
+        cooldown.
         """
-        snapshot = None
         try:
             if self.hold_when_all_over:
-                snapshot = self._usage_snapshot()
                 target = self._under_threshold_target(snapshot)
                 if target is None:
                     self._status("no switch: no account is under its threshold")
@@ -531,10 +630,10 @@ class WrapSession:
                     strategy=self.strategy, json_output=True, models=self.models
                 )
         except ClaudeSwitchError as e:
-            self._status(yellowed(f"switch failed: {e}"))
+            self._status(f"switch failed: {e}")
             return False
         except Exception as e:  # the wrapper must outlive errors
-            self._status(yellowed(f"switch error ({e!r}); will retry"))
+            self._status(f"switch error ({e!r}); will retry")
             return False
         if not result or not result.get("switched"):
             reason = (result or {}).get("reason", "no viable account")
@@ -542,10 +641,7 @@ class WrapSession:
             return False
         to = result.get("to") or {}
         self._record_switch(result, snapshot)
-        self._status(
-            accent(f"switched to Account-{to.get('number')} ({to.get('email')})")
-        )
-        self._resume()
+        self._resume(f"switched to Account-{to.get('number')} ({to.get('email')})")
         return True
 
     def _record_switch(
@@ -574,18 +670,23 @@ class WrapSession:
                 from_usage=usage.get(str(from_number)) if from_number else None,
                 models=self.models,
             )
-        except Exception as e:  # never let the record break the resume
-            self._status(dimmed(f"couldn't record the switch for cswap auto ({e!r})"))
+        except Exception as e:
+            self._status(f"couldn't record the switch for cswap auto ({e!r})")
 
-    def _resume(self) -> None:
-        """Type ``continue`` at the prompt, unless auto-continue is off."""
+    def _resume(self, event: str) -> None:
+        """Report ``event`` and type ``continue`` at the prompt, unless
+        auto-continue is off."""
         if not self.auto_continue:
-            self._status("auto-continue off — type 'continue' yourself to resume")
+            self._status(
+                f"{event}; auto-continue is off — type 'continue' to resume",
+                notify=True,
+            )
             return
         if self._stop.wait(CONTINUE_DELAY_S):
+            self._status(f"{event}; claude exited before the turn was resumed")
             return
         self._inject(b"continue\r")
-        self._status("resumed (typed 'continue')")
+        self._status(f"{event}; resumed (typed 'continue')", notify=True)
 
     def _inject(self, data: bytes) -> None:
         """Type into claude as if the user pressed the keys."""
