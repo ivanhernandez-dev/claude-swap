@@ -87,7 +87,7 @@ class AutoScreen(Screen):
         self._configured_threshold: float | None = None
         self._configured_session: float | None = None
         self._configured_weekly: float | None = None
-        self._entry_threshold: float | None = None
+        self._entry_threshold: tuple[float, float] | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -154,7 +154,7 @@ class AutoScreen(Screen):
             self._end_adjust()
             return
         self._adjusting = True
-        self._entry_threshold = self._settings.threshold
+        self._entry_threshold = self._effective_thresholds()
         self._update_summary()
         self.refresh_bindings()
 
@@ -173,7 +173,7 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._update_summary()
         self.refresh_bindings()
-        if self._settings.threshold == self._entry_threshold:
+        if self._effective_thresholds() == self._entry_threshold:
             return  # no net change: nothing to announce, no tick to force
         if self._engine is not None:
             self._engine.wake()  # show a decision at the new value now
@@ -185,8 +185,14 @@ class AutoScreen(Screen):
             )
         )
 
+    def _effective_thresholds(self) -> tuple[float, float]:
+        return (
+            self._settings.effective_session_threshold,
+            self._settings.effective_weekly_threshold,
+        )
+
     def _set_threshold(self, value: float) -> None:
-        if value == self._settings.threshold:
+        if self._effective_thresholds() == (value, value):
             return
         # One session knob for every window: the split values (if any) are
         # set aside for the session, exactly as apply_threshold() does.

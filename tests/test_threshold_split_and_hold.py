@@ -17,6 +17,7 @@ import pytest
 
 from claude_swap import oauth, poll_policy, wrap
 from claude_swap.autoswitch import (
+    AllExhaustedEvent,
     HoldEndEvent,
     HoldEvent,
     NoSwitchEvent,
@@ -418,6 +419,21 @@ class TestAllOverThresholdHold:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
+    def test_no_hold_is_announced_when_every_candidate_is_at_its_limit(
+        self, temp_home
+    ):
+        h = _harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _u(100, 40, five_reset=now + 3600),
+            "2": _u(100, 40, five_reset=now + 1800),
+            "3": _u(100, 40, five_reset=now + 7200),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert _of(h, AllExhaustedEvent)
+        assert not _of(h, HoldEvent)
+        assert "hold" not in h.state()
+
     def test_hold_off_restores_the_old_escape(self, temp_home):
         h = _harness(temp_home, hold_when_all_over_threshold=False)
         outcome = h.tick_with_usage(self._all_over(h))
@@ -557,6 +573,7 @@ class _WrapSwitcher:
         self._accounts = list(accounts)
         self.switch_calls = 0
         self.switch_to_calls: list[tuple[str, str]] = []
+        self.fetches: list[set[str] | None] = []
         if backup_dir is not None:
             self.backup_dir = backup_dir
 
@@ -580,7 +597,8 @@ class _WrapSwitcher:
             for n in self._accounts
         ]
 
-    def _collect_usage_entries(self, accounts_info):
+    def _collect_usage_entries(self, accounts_info, fetch=None):
+        self.fetches.append(fetch)
         snapshot = self._snapshots[0]
         if len(self._snapshots) > 1:
             self._snapshots.pop(0)
@@ -598,12 +616,22 @@ _SWITCHED = {
 }
 
 
-def _wrap_session(switcher, *, hold=True, clock=lambda: NOW, thresholds=(90.0, 90.0)):
+def _wrap_session(
+    switcher,
+    *,
+    hold=True,
+    clock=lambda: NOW,
+    thresholds=(90.0, 90.0),
+    strategy="best",
+):
     lines: list[str] = []
+    notifications: list[str] = []
     session = wrap.WrapSession(
         switcher,
         [],
+        strategy=strategy,
         out=lines.append,
+        notify=notifications.append,
         clock=clock,
         thresholds_for=lambda num: thresholds,
         hold_when_all_over=hold,
@@ -611,6 +639,7 @@ def _wrap_session(switcher, *, hold=True, clock=lambda: NOW, thresholds=(90.0, 9
     session.injected = []
     session._inject = session.injected.append
     session.lines = lines
+    session.notifications = notifications
     return session
 
 
@@ -654,18 +683,43 @@ class TestWrapHold:
         assert session.injected == [b"continue\r"]
         assert any("quota is back on Account-1" in ln for ln in session.lines)
 
-    def test_active_with_quota_and_everyone_over_does_not_wait(self):
+    def test_active_with_quota_and_everyone_over_rechecks_then_gives_up(self):
         snap = {"1": _u(95, 40), "2": _u(93, 40)}
         switcher = _WrapSwitcher([snap], [])
         session = _wrap_session(switcher)
-
-        def no_sleep(seconds):
-            pytest.fail("waited although the active account has quota")
-
-        session._sleep = no_sleep
+        sleeps = _bounded_sleeps(session, limit=1)
         session._recover("You've hit your Opus limit")
+        assert sleeps == [wrap.RECHECK_DELAY_S]
+        assert {"1"} in switcher.fetches
         assert switcher.switch_calls == 0
         assert session.injected == []
+        assert any("not switching" in n for n in session.notifications)
+
+    def test_a_stale_reading_on_the_active_account_does_not_end_the_recovery(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(wrap, "CONTINUE_DELAY_S", 0.0)
+        stale = {
+            "1": _u(97, 40, five_reset=NOW + 3600),
+            "2": _u(95, 40, five_reset=NOW + 1800),
+        }
+        refreshed = {
+            "1": _u(100, 40, five_reset=NOW + 3600),
+            "2": _u(95, 40, five_reset=NOW + 1800),
+        }
+        released = {
+            "1": _u(100, 40, five_reset=NOW + 3600),
+            "2": _u(0, 40),
+        }
+        switcher = _WrapSwitcher([stale, refreshed, refreshed, released], [])
+        session = _wrap_session(switcher)
+        sleeps = _bounded_sleeps(session)
+        session._recover("You've hit your session limit")
+        assert sleeps[0] == wrap.RECHECK_DELAY_S
+        assert sleeps[1] == pytest.approx(1800 + poll_policy.RESET_SLACK_S)
+        assert [t for t, _ in switcher.switch_to_calls] == ["2"]
+        assert session.injected == [b"continue\r"]
+        assert any("holding on Account-1" in n for n in session.notifications)
 
     def test_a_candidate_under_threshold_switches_immediately(self, monkeypatch):
         monkeypatch.setattr(wrap, "CONTINUE_DELAY_S", 0.0)
@@ -786,6 +840,35 @@ class TestWrapTargetsUnderThreshold:
         assert [t for t, _ in switcher.switch_to_calls] == ["3"]
         _, detail = switcher.switch_to_calls[0]
         assert detail == "wrap at-limit; from #1 5h 100% · 7d 0% -> to #3 5h 20% · 7d 30%"
+
+    def test_next_available_takes_rotation_order_among_the_under_threshold(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(wrap, "CONTINUE_DELAY_S", 0.0)
+        snap = {
+            "1": _u(100, 0),
+            "2": _u(95, 0),
+            "3": _u(60, 10),
+            "4": _u(5, 5),
+        }
+        switcher = _WrapSwitcher([snap], [], accounts=("1", "2", "3", "4"))
+        session = _wrap_session(switcher, strategy="next-available")
+        _bounded_sleeps(session, limit=0)
+        session._recover("You've hit your session limit")
+        assert [t for t, _ in switcher.switch_to_calls] == ["3"]
+
+    def test_next_available_wraps_around_the_rotation(self, monkeypatch):
+        monkeypatch.setattr(wrap, "CONTINUE_DELAY_S", 0.0)
+        snap = {"1": _u(40, 0), "2": _u(100, 0), "3": _u(95, 0)}
+        switcher = _WrapSwitcher([snap], [], accounts=("1", "2", "3"))
+        switcher._build_accounts_info = lambda: [
+            (int(n), f"{n}@example.com", "", "", n == "2", "", "")
+            for n in ("1", "2", "3")
+        ]
+        session = _wrap_session(switcher, strategy="next-available")
+        _bounded_sleeps(session, limit=0)
+        session._recover("You've hit your session limit")
+        assert [t for t, _ in switcher.switch_to_calls] == ["1"]
 
     def test_keeps_waiting_while_nothing_is_under(self, monkeypatch):
         # #2 is at its limit and #3 unreadable: not a hold (nothing movable

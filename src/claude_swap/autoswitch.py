@@ -1021,7 +1021,7 @@ class AutoSwitchEngine:
         getter = getattr(self.switcher, "account_threshold_overrides", None)
         if callable(getter):
             overrides = getter(account_num)
-        else:  # a switcher stand-in that only knows the shared override
+        else:
             shared = self.switcher.account_threshold_override(account_num)
             overrides = (shared, shared)
         return account_thresholds(self.settings, overrides)
@@ -1151,7 +1151,9 @@ class AutoSwitchEngine:
         Entering and leaving are each announced ONCE (HoldEvent /
         HoldEndEvent), persisted in the state file so cron ``--once`` ticks
         behave the same. An indeterminate tick (active or every candidate
-        unreadable) keeps the previous verdict rather than flapping it.
+        unreadable) keeps the previous verdict rather than flapping it, and
+        so does a tick where every candidate is at its hard limit: there is
+        no move to hold back from, and the all-exhausted path reports it.
         """
         was = (
             self._holding
@@ -1164,6 +1166,10 @@ class AutoSwitchEngine:
             )
         else:
             verdict = False
+        if verdict and not any(
+            (headroom.get(n) or 0.0) > 0 for n in oauth_candidates
+        ):
+            verdict = None
         holding = was if verdict is None else verdict
         release_ts = None
         if holding:
@@ -1205,7 +1211,7 @@ class AutoSwitchEngine:
 
     def _persist_hold(self, value: dict | None) -> None:
         if self.dry_run:
-            return  # dry-run writes nothing; the in-memory flag suffices
+            return
 
         def put(state: dict) -> None:
             if value is None:
